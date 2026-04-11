@@ -520,7 +520,7 @@ fn scr_display_name(path: &str) -> Option<String> {
 pub struct SystemTab {
     pub h_lbl_title:          HWND,
     pub h_lbl_desc:           HWND,
-    // ── Display section ───────────────────────────────────────────────────────
+    // ── Taskbar section ───────────────────────────────────────────────────────
     pub h_lbl_sect_display:   HWND,
     pub h_sep_display:        HWND,
     pub h_btn_taskbar_autohide:    HWND,
@@ -584,8 +584,8 @@ impl SystemTab {
 
         let font_sect = make_font_cached(w!("Segoe UI"), 11, dpi, true);
 
-        // ── Display section ───────────────────────────────────────────────────
-        let h_lbl_sect_display = cb.static_text(w!("Display"), SS_NOPREFIX);
+        // ── Taskbar section ───────────────────────────────────────────────────
+        let h_lbl_sect_display = cb.static_text(w!("Taskbar"), SS_NOPREFIX);
         SendMessageW(h_lbl_sect_display, WM_SETFONT,
             WPARAM(font_sect.0 as usize), LPARAM(1));
 

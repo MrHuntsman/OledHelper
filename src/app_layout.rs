@@ -294,7 +294,7 @@ impl LayoutGrid {
         let tog_st_x = self.main_x + tog_w + self.s(10);
         let tog_st_w = self.main_x + self.main_w - tog_st_x;
 
-        // ── "Display" section ─────────────────────────────────────────────────
+        // ── "Taskbar" section ─────────────────────────────────────────────────
         self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
             st.system.h_lbl_sect_display, self.s(4));
         self.place_separator(&mut y, self.main_x, self.main_w,

@@ -158,6 +158,13 @@ pub struct AppState {
     /// Avoids a registry enumeration loop inside the hot `apply_ramp` path.
     nvidia_cam_enabled: bool,
 
+    /// Last gamma-block state seen by TIMER_HDR.
+    /// `None` = not yet evaluated (forces a set_error call on the first tick).
+    /// `Some(true)` = gamma was blocked last tick; `Some(false)` = was clear.
+    /// Only calling set_error on *transitions* prevents the 2-second wipe of
+    /// unrelated error messages set by other code paths.
+    last_gamma_blocked: Option<bool>,
+
     /// Debounce flag for black-level gamma application.
     ramp_dirty: bool,
 }
@@ -681,9 +688,50 @@ unsafe extern "system" fn wnd_proc(
                                 InvalidateRect(st.h_btn_hdr_toggle, None, true);
                                 UpdateWindow(st.h_btn_hdr_toggle);
                             }
+
+                            // Poll for gamma block on the crush tab — independent of slider
+                            // moves so the error label is never cleared by ramp call noise.
+                            {
+                                st.nvidia_cam_enabled = CrushTab::is_nvidia_cam_enabled();
+                                let blocked = st.nvidia_cam_enabled || is_gamma_blocked(&st.crush);
+
+                                let tick = windows::Win32::System::SystemInformation::GetTickCount64();
+                                let detail = format!(
+                                    "[GAMMA] tab={} nvidia_cam={} blocked={} debug_mode={} v={}",
+                                    st.active_tab,
+                                    st.nvidia_cam_enabled,
+                                    blocked,
+                                    is_debug_mode(),
+                                    crate::ui_drawing::get_slider_val(st.crush.h_sld_black),
+                                );
+                                if let Some(Ok(mut log)) = zorder_log().map(|m| m.lock()) {
+                                    log.push(tick, ZLogKind::DisplayChange, blocked as u64, detail);
+                                }
+
+                                // Track state transitions so the clear (set_error "")
+                                // only fires when gamma actually becomes unblocked —
+                                // not every 2 s, which was wiping unrelated messages.
+                                let gamma_blocked_now = st.nvidia_cam_enabled || blocked;
+                                let state_changed = st.last_gamma_blocked != Some(gamma_blocked_now);
+                                st.last_gamma_blocked = Some(gamma_blocked_now);
+
+                                if st.active_tab == 0 {
+                                    if gamma_blocked_now {
+                                        // Always refresh the blocked label — idempotent and
+                                        // ensures it shows even if the user just switched to
+                                        // tab 0 after the initial transition was recorded.
+                                        if st.nvidia_cam_enabled {
+                                            set_error(st, "⚠ Gamma blocked by GPU driver - disable \"Override to reference mode\"");
+                                        } else {
+                                            set_error(st, "⚠ Gamma blocked by GPU driver");
+                                        }
+                                    } else if state_changed {
+                                        // Only clear on an actual unblocked transition.
+                                        set_error(st, "");
+                                    }
+                                }
+                            }
                         }
-                        // Refresh NVIDIA CAM cache so apply_ramp doesn't do registry I/O.
-                        st.nvidia_cam_enabled = CrushTab::is_nvidia_cam_enabled();
                         maybe_restore_gamma(st, hwnd);
                         
                         SetTimer(hwnd, TIMER_HDR, 2000, None);
@@ -1395,7 +1443,23 @@ unsafe fn create_state(hwnd: HWND, ini_path: PathBuf) -> AppState {
     let h_btn_hdr_toggle  = cb.button(w!("HDR Toggle"), IDC_BTN_HDR_TOGGLE);
     SetWindowSubclass(h_btn_hdr_toggle, Some(hdr_toggle_subclass_proc), 1, 0);
     let h_lbl_status   = cb.static_text(w!(""), SS_CENTER | SS_CENTERIMAGE);
-    let h_lbl_error    = cb.static_text(w!(""), SS_CENTER | SS_CENTERIMAGE);
+    // h_lbl_error is intentionally NOT WS_EX_TRANSPARENT even though it shares
+    // the same rect as h_lbl_status.  WS_EX_TRANSPARENT removes the control from
+    // GDI clipping, which lets h_lbl_status's background fill paint through it and
+    // erase the error text on every status repaint.  A solid (WS_EX_LEFT) window
+    // with higher z-order (created after h_lbl_status) clips h_lbl_status's paint
+    // around itself, so the error text is never erased by a sibling repaint.
+    let h_lbl_error = CreateWindowExW(
+        WS_EX_LEFT,
+        w!("STATIC"), w!(""),
+        WS_CHILD | WINDOW_STYLE(SS_CENTER as u32 | SS_CENTERIMAGE as u32 | SS_NOPREFIX),
+        0, 0, 1, 1,
+        hwnd,
+        HMENU(ptr::null_mut()),
+        hinstance,
+        None,
+    ).unwrap_or_default();
+    SendMessageW(h_lbl_error, WM_SETFONT, WPARAM(_font_normal.0 as usize), LPARAM(1));
 
     // ── Separators ────────────────────────────────────────────────────────────
     let sep_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_BLACKRECT);
@@ -1500,6 +1564,7 @@ let hotkeys = HotkeysTab::new(
         zorder_winevent_hooks: None,
         mouse_hotkeys: [0u32; 9],
         nvidia_cam_enabled: unsafe { CrushTab::is_nvidia_cam_enabled() },
+        last_gamma_blocked: None,
         ramp_dirty: false,
     };
 
@@ -1564,27 +1629,29 @@ let hotkeys = HotkeysTab::new(
 
 unsafe fn apply_ramp(st: &mut AppState, hwnd: HWND) {
     if st.crush.previewing { return; }
-    let (ok, v) = st.crush.apply_ramp();
-
-    // ── Persistent error label — always reflects current driver state ─────────
-    if st.nvidia_cam_enabled {
-        set_error(st, "⚠  Gamma blocked — disable NVIDIA Override / Colour Accuracy Mode");
-        return;
-    }
-    if !ok {
-        set_error(st, "⚠  Gamma blocked by GPU driver");
-        return;
-    }
-    // Condition cleared — hide the error label.
-    set_error(st, "");
+    st.crush.apply_ramp();
 }
 
 unsafe fn maybe_restore_gamma(st: &mut AppState, hwnd: HWND) {
-    // Restore the currently active gamma state if an external process has
-    // overridden it while the app was visible or inactive.
-    if st.crush.maybe_restore_desired_ramp() {
-        // If restoration succeeded, clear any stale error state.
-        set_error(st, "");
+    st.crush.maybe_restore_desired_ramp();
+}
+
+/// Returns true if the GPU driver is currently ignoring gamma ramp writes.
+///
+/// Reads the *current* display ramp and compares it to the desired ramp
+/// without writing first.  The previous write-then-readback approach raced
+/// with async GPU driver overrides: the readback sometimes caught the ramp
+/// before the driver had a chance to revert it, causing the blocked state to
+/// flip every 2 s.
+///
+/// If the driver is truly blocking, the display ramp will already differ from
+/// what we last wrote (the driver will have reverted it to its own value).
+/// Returns false if GetDeviceGammaRamp fails (can't tell, assume unblocked).
+unsafe fn is_gamma_blocked(crush: &crate::tab_crush::CrushTab) -> bool {
+    let desired = crush.desired_ramp();
+    match gamma_ramp::get_display_ramp() {
+        Some(actual) => actual != desired,
+        None => false,
     }
 }
 
@@ -1594,6 +1661,32 @@ unsafe fn show_tab(st: &mut AppState, hwnd: HWND) {
     let tab = st.active_tab;
 
     st.crush.group.set_visible(tab == 0);
+
+    // h_lbl_status and h_lbl_error belong to the Black Crush tab only.
+    // Hide them entirely when any other tab is active, and restore the
+    // correct error state when returning to tab 0.
+    if tab == 0 {
+        // Refresh the gamma-blocked error label whenever tab 0 becomes active.
+        // last_gamma_blocked may have been set while the user was on another tab,
+        // so the label would otherwise stay blank until the next TIMER_HDR tick.
+        if let Some(blocked) = st.last_gamma_blocked {
+            if blocked {
+                if st.nvidia_cam_enabled {
+                    set_error(st, "⚠  Gamma blocked — disable NVIDIA Override / Colour Accuracy Mode");
+                } else {
+                    set_error(st, "⚠  Gamma blocked by GPU driver");
+                }
+            } else {
+                set_error(st, "");
+            }
+        }
+        // h_lbl_status visibility is managed by set_status / TIMER_STATUS_CLEAR;
+        // no action needed here — it will show itself on the next set_status call.
+    } else {
+        // Leaving tab 0 — hide both labels so they don't bleed into other tabs.
+        set_visible(st.h_lbl_status, false);
+        set_visible(st.h_lbl_error, false);
+    }
 
     set_visible(st.dimmer.h_lbl_dim_title,   tab == 1);
     set_visible(st.dimmer.h_lbl_dim_sub,     tab == 1);
@@ -1839,9 +1932,21 @@ unsafe fn set_status(st: &mut AppState, text: &str, color: COLORREF) {
 /// Show or clear the persistent error label (shown below the status label).
 /// Pass an empty string to hide it.
 unsafe fn set_error(st: &mut AppState, text: &str) {
+    // ── Debug: log every set_error call so we can see what's clearing it ─────
+    if is_debug_mode() {
+        let tick = windows::Win32::System::SystemInformation::GetTickCount64();
+        let detail = format!("[SET_ERROR] text={:?} tab={}", text, st.active_tab);
+        if let Some(Ok(mut log)) = zorder_log().map(|m| m.lock()) {
+            log.push(tick, ZLogKind::DisplayChange, text.is_empty() as u64, detail);
+        }
+    }
+
     set_window_text(st.h_lbl_error, text);
     set_visible(st.h_lbl_error, !text.is_empty());
-    InvalidateRect(st.h_lbl_error, None, true);
+    RedrawWindow(
+        st.h_lbl_error, None, None,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE,
+    );
 }
 
 // ── Render timer ──────────────────────────────────────────────────────────────

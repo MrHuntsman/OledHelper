@@ -99,8 +99,8 @@ pub const MAX_BLACK:     i32 = 15;
 pub const DEFAULT_BLACK: i32 = 0;
 
 // Minimum window size in logical pixels (96 DPI baseline).
-pub const MIN_WIN_W: i32 = 700;
-pub const MIN_WIN_H: i32 = 720;
+pub const MIN_WIN_W: i32 = 720;
+pub const MIN_WIN_H: i32 = 730;
 
 // ── Startup shortcut ──────────────────────────────────────────────────────────
 // CSIDL_STARTUP is exported by windows-rs Shell::* — do not redefine it here.
