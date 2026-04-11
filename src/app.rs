@@ -1,12 +1,5 @@
-// app.rs — AppState definition, main window entry point, WndProc, layout,
-//          and cross-tab shared business logic (tray, startup, status bar).
-//
-// Per-tab logic has been extracted into dedicated modules:
-//   tab_crush.rs  — Black Crush Tweak tab (gamma ramp, Hz profiles, compare button)
-//   tab_dimmer.rs — Taskbar Dimmer tab (overlay windows, fade animation, auto-hide detection)
-//
-// Rendering helpers (subclass procs, paint routines, modal dialogs) live in
-// ui_drawing.rs. Compile-time constants and IDs live in constants.rs.
+// app.rs — AppState, main window entry, WndProc, and shared logic.
+// Per-tab logic is in tab_*.rs. Helpers in ui_drawing.rs and win32.rs.
 
 #![allow(non_snake_case, clippy::too_many_lines, unused_variables,
          unused_mut, unused_assignments, unused_must_use)]
@@ -39,7 +32,7 @@ use crate::{
     constants::*,
     hotkeys::{
         HK_TOGGLE_DIM, HK_TOGGLE_CRUSH, HK_HOLD_COMPARE,
-        HK_DECREASE, HK_INCREASE, HK_DIM_DECREASE, HK_DIM_INCREASE,
+        HK_DECREASE, HK_INCREASE, HK_DIM_DECREASE, HK_DIM_INCREASE, HK_TOGGLE_HDR,
         MOUSE_HK_SLOTS,
         install_compare_hook, uninstall_compare_hook,
         ensure_mouse_hook_installed, uninstall_mouse_hook,
@@ -55,6 +48,8 @@ use crate::{
     tab_debug::DebugTab,
     tab_about::AboutTab,
     tab_hotkeys::{HotkeysTab, draw_hotkey_pill},
+    tab_system::{SystemTab, IDC_SYS_DDL_SCREEN_TIMEOUT, IDC_SYS_DDL_SLEEP_TIMEOUT,
+                 IDC_SYS_DDL_SCREENSAVER, IDC_SYS_EDT_SS_TIMEOUT},
     tab_dimmer::{DimmerTab, ZOrderWinEventHooks, ZLogKind, zorder_log},
     ui_drawing::{
         self,
@@ -64,6 +59,7 @@ use crate::{
         set_bounds, set_window_text,
         slider_subclass_proc, nav_btn_subclass_proc,
         hdr_toggle_subclass_proc, dimmer_toggle_subclass_proc,
+        install_action_btn_hover,
         SetWindowSubclass,
     },
     win32::{
@@ -85,8 +81,7 @@ const WM_APP_DEFERRED_DPI_RESIZE: u32 = WM_APP + 10;
 
 use std::cell::Cell;
 thread_local! {
-    /// Stores the suggested RECT from WM_DPICHANGED so the deferred resize
-    /// handler (WM_APP_DEFERRED_DPI_RESIZE) can read it without extra allocations.
+    /// Suggested RECT from WM_DPICHANGED for deferred resize.
     static DEFERRED_DPI_RECT: Cell<RECT> = Cell::new(RECT::default());
 }
 
@@ -103,11 +98,13 @@ pub struct AppState {
     pub crush:  CrushTab,
     /// Taskbar Dimmer tab (tab 1).
     pub dimmer: DimmerTab,
-    /// Hotkeys tab (tab 2).
+    /// System tab (tab 2).
+    pub system: SystemTab,
+    /// Hotkeys tab (tab 3).
     pub hotkeys: HotkeysTab,
-    /// Debug tab (tab 3).
+    /// Debug tab (tab 4).
     pub debug: DebugTab,
-    /// About tab (tab 4).
+    /// About tab (tab 5).
     pub about: AboutTab,
 
     // ── Shared controls ───────────────────────────────────────────────────────
@@ -121,7 +118,7 @@ pub struct AppState {
     pub h_sep_vert:       HWND,
     pub h_sep_h:          [HWND; 4],
     /// Left-panel vertical navigation buttons (one per tab).
-    pub h_nav_btn:        [HWND; 5],
+    pub h_nav_btn:        [HWND; 6],
 
     /// App icon used in the nav button for tab 0.
     h_app_icon:   HICON,
@@ -141,7 +138,6 @@ pub struct AppState {
     _font_title:    HFONT,
     _font_bold_val: HFONT,
 
-    // ── Tray / misc ───────────────────────────────────────────────────────────
     tray_menu:   HMENU,
     tray_added:  bool,
 
@@ -155,22 +151,20 @@ pub struct AppState {
 
     /// Mouse-button bindings that can't use RegisterHotKey.
     /// Indexed by HK_* constant; value is a MB_* sentinel (0 = unbound).
-    mouse_hotkeys: [u32; 8],
+    mouse_hotkeys: [u32; 9],
 
     /// Cached result of `CrushTab::is_nvidia_cam_enabled()`.
     /// Refreshed at startup and on every TIMER_HDR tick (~2 s).
     /// Avoids a registry enumeration loop inside the hot `apply_ramp` path.
     nvidia_cam_enabled: bool,
 
-    /// Set to `true` when the black-level slider moves during a drag.
-    /// `TIMER_RAMP_APPLY` fires ~50 ms later and calls `apply_ramp`, then
-    /// clears this flag.  Keeps `SetDeviceGammaRamp` off the hot drag path.
+    /// Debounce flag for black-level gamma application.
     ramp_dirty: bool,
 }
 
 impl AppState {
-    /// Recreate all DPI-sensitive fonts and push them to every child control.
-    /// Call this inside WM_APP_DEFERRED_DPI_RESIZE before SetWindowPos.
+    /// Recreate fonts and update all child controls.
+    /// Called during deferred DPI resize before layout reflow.
     pub unsafe fn rebuild_fonts(&mut self, hwnd: HWND) {
         let dpi = GetDpiForWindow(hwnd).max(96);
 
@@ -197,6 +191,7 @@ impl AppState {
         for &h in &[
             self.crush.h_lbl_title,
             self.dimmer.h_lbl_dim_title,
+            self.system.h_lbl_title,
             self.hotkeys.h_lbl_title,
             self.debug.h_lbl_title,
             self.about.h_lbl_title,
@@ -226,6 +221,9 @@ impl AppState {
             self.debug.h_lbl_sect_log,
             self.about.h_lbl_sect_about,
             self.about.h_lbl_sect_update,
+            self.system.h_lbl_sect_power,
+            self.system.h_lbl_sect_screensaver,
+            self.system.h_lbl_sect_mouse,
         ] {
             SendMessageW(h, WM_SETFONT, WPARAM(font_sect.0 as usize), LPARAM(1));
         }
@@ -265,6 +263,7 @@ impl AppState {
         let hdr_pairs: &[(HWND, Option<HBITMAP>)] = &[
             (self.crush.h_lbl_title,      self.tab_header_icons.crush),
             (self.dimmer.h_lbl_dim_title, self.tab_header_icons.dimmer),
+            (self.system.h_lbl_title,     self.tab_header_icons.system),
             (self.hotkeys.h_lbl_title,    self.tab_header_icons.hotkeys),
             (self.debug.h_lbl_title,      self.tab_header_icons.debug),
             (self.about.h_lbl_title,      self.tab_header_icons.about),
@@ -344,8 +343,13 @@ pub unsafe fn run(ini_path: PathBuf) -> Result<()> {
         None, None, hinstance, Some(create_param),
     )?;
 
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    // If launched via the Windows startup registry entry (--minimized flag),
+    // skip showing the window — the tray icon is already added inside
+    // create_state, so the app is fully accessible from the tray immediately.
+    if !startup::launched_minimized() {
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+    }
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -396,6 +400,19 @@ unsafe extern "system" fn wnd_proc(
             // change is unnecessary and was a known VRR flicker trigger.
             // timeBeginPeriod(1) remains available for slider animations via
             // the slider subclass, but is not set for the whole app lifetime.
+            // Register for power setting change notifications for the two
+            // timeout GUIDs so WM_POWERBROADCAST/PBT_POWERSETTINGCHANGE fires
+            // whenever Windows Settings (or anything else) changes them.
+            RegisterPowerSettingNotification(
+                HANDLE(hwnd.0),
+                &crate::tab_system::GUID_VIDEO_POWERDOWN_TIMEOUT,
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
+            RegisterPowerSettingNotification(
+                HANDLE(hwnd.0),
+                &crate::tab_system::GUID_STANDBY_TIMEOUT,
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
             SetTimer(hwnd, TIMER_HDR,          2000, None);
             // TIMER_DEBUG_REFRESH is NOT started here.  It is armed by show_tab
             // when the user switches to the debug tab (tab 3) and killed when
@@ -405,21 +422,8 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         
-       // 1. DPI Change: the app's effective DPI changed, but the display geometry
-       //    has NOT changed yet — the taskbar is still in its old position.
-       //
-       //    IMPORTANT: Do NOT call SetWindowPos/RedrawWindow synchronously here.
-       //    WM_DPICHANGED is sent via SendMessage (not posted), which means it
-       //    arrives while the display change broadcast is in progress.  Any
-       //    synchronous layout work (SetWindowPos + WM_SIZE reflow + child
-       //    control repaints) blocks the message loop for the entire duration,
-       //    preventing WM_DISPLAYCHANGE from arriving.  This was causing the
-       //    ~2.4 s delay between [DP] and [DC] in the debug log.
-       //
-       //    Fix: stash the suggested rect in a thread-local and post
-       //    WM_APP_DEFERRED_DPI_RESIZE to ourselves.  The posted message is
-       //    processed after SendMessage returns and the broadcast finishes, so
-       //    WM_DISPLAYCHANGE can arrive in the very next pump cycle.
+       // 1. DPI Change: Post resize message to avoid blocking display broadcast.
+       // Synchronous layout here prevents WM_DISPLAYCHANGE from arriving promptly.
        WM_DPICHANGED => {
             let prc = lparam.0 as *const RECT;
             let new_rect = unsafe { *prc };
@@ -443,38 +447,21 @@ unsafe extern "system" fn wnd_proc(
             // Stash the suggested rect so the deferred handler can read it.
             DEFERRED_DPI_RECT.with(|cell| cell.set(new_rect));
 
-            // Post (not send) the deferred resize.  This returns immediately,
-            // allowing WM_DISPLAYCHANGE to be dispatched before the layout work.
             unsafe {
                 PostMessageW(hwnd, WM_APP_DEFERRED_DPI_RESIZE, WPARAM(0), LPARAM(0));
             }
 
-            // Even though display geometry hasn't fully switched yet, we can call
-// reposition_overlays_now() safely: collect_taskbar_rects() uses
-// GetMonitorInfoW which returns physical-pixel rects regardless of the
-// current DPI state.  The overlay will be at or very near the correct
-// position immediately, and tick_reposition will correct any remaining
-// offset once WM_DISPLAYCHANGE arrives.
-if let Some(st) = borrow_state::<AppState>(hwnd) {
-    if st.dimmer.enabled {
-        st.dimmer.start_reposition_overlays(); // hides + starts polling
-    }
-}
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                if st.dimmer.enabled {
+                    st.dimmer.start_reposition_overlays();
+                }
+            }
             LRESULT(0)
         }
 
-        // Deferred handler: performs the SetWindowPos + layout reflow that was
-        // previously done synchronously inside WM_DPICHANGED.  By the time this
-        // fires, WM_DISPLAYCHANGE has already been dispatched, so the new display
-        // geometry is known and the taskbar rect is stable.
-        //
-        // If start_reposition_overlays() was called from WM_DISPLAYCHANGE and the
-        // polling loop is still running, we skip the remaining ticks and reposition
-        // immediately — the taskbar has settled now that the DPI reflow is done.
-        // This eliminates the ~2.4 s delay seen when opening from the taskbar
-        // (where WM_DPICHANGED blocked for the full first-paint layout pass before
-        // WM_DISPLAYCHANGE could arrive, leaving tick_reposition polling long after
-        // the taskbar had already moved to its final position).
+        // Deferred handler: executes resize after display broadcast settles.
+        // If a reposition poll is active, it short-circuits here as the
+        // taskbar rect is now stable.
         WM_APP_DEFERRED_DPI_RESIZE => {
             let new_rect = DEFERRED_DPI_RECT.with(|cell| cell.get());
 
@@ -518,10 +505,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
 
             log_dr!(0u64, "entry");
 
-            // Rebuild all DPI-sensitive fonts and push them to every child
-            // control BEFORE SetWindowPos triggers the layout reflow (WM_SIZE →
-            // app_layout::apply).  This ensures controls paint with the correct
-            // font size immediately on their first post-resize WM_PAINT.
+            // Rebuild fonts before SetWindowPos triggers layout reflow.
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 st.rebuild_fonts(hwnd);
             }
@@ -539,16 +523,12 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             log_dr!(1u64, "after SetWindowPos");
 
             unsafe {
-                // RDW_UPDATENOW flushes the WS_EX_COMPOSITED backbuffer
-                // synchronously — same fix as WM_SIZE and WM_DISPLAYCHANGE.
                 RedrawWindow(hwnd, None, None,
                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
             }
 
             log_dr!(2u64, "after RedrawWindow");
 
-            // If a reposition poll is in flight, short-circuit it now.
-            // The taskbar rect is stable at this point — no need to keep waiting.
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 if st.dimmer.enabled && st.dimmer.is_repositioning {
                     unsafe {
@@ -562,14 +542,13 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             LRESULT(0)
         }
 
-        // 2. Resolution Change: the display has actually switched.
-        //    WM_DPICHANGED (if any) was sent via SendMessage and is fully
-        //    processed before this arrives, so the main window is already
-        //    at its new size. Reposition overlays immediately — no timer needed.
+        // 2. Resolution Change: display switched. Reposition overlays via polling.
         WM_DISPLAYCHANGE => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 // Log immediately — delta from WM_DPICHANGED shows how long the
                 // main window resize took before the display actually switched.
+                
+
                 if is_debug_mode() {
                     let lp = lparam.0 as u32;
                     let width  = lp & 0xFFFF;
@@ -586,68 +565,83 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                     }
                 }
 
-                // Hide the overlays immediately and start the polling loop.
-                //
-                // We used to call reposition_overlays_now() here, but that
-                // moves the overlay to the new coords before the shell taskbar
-                // has physically moved — causing a ~2 s window where the overlay
-                // is covering empty space and the taskbar is uncovered.
-                //
-                // start_reposition_overlays() hides the overlays instantly (no
-                // visual artifact) and arms TIMER_OVERLAY_REPOSITION to poll
-                // every 100 ms.  tick_reposition() keeps firing until two
-                // consecutive samples return the same taskbar rect, at which
-                // point the taskbar has settled and we show the overlay there.
+                // Re-query HDR state over the next several ticks.  DXGI often
+                // reports stale colour space data immediately after a display
+                // change while the driver finishes its pipeline switch.
+                st.crush.hdr_panel.schedule_hdr_recheck();
+
+                // When an external tool (game, Windows display settings, etc.)
+                // changes the refresh rate the CBN_SELCHANGE path is never
+                // reached, so the Hz-keyed profile is never applied.  Detect
+                // the new Hz now and load the matching profile — exactly the
+                // same steps the dropdown handler performs.
+                let hz = get_current_hz();
+                st.crush.populate_refresh_rates(&mut st.ini);
+                update_slider_anim_interval(hz);
+                crate::tab_dimmer::set_fade_interval_from_hz(hz);
+                if let Some((_, status)) =
+                    st.crush.try_auto_load_profile_for_hz(hz, &mut st.ini)
+                {
+                    set_status(st, &status, C_ACCENT);
+                } else {
+                    // Hz has no saved non-zero profile — still reapply the
+                    // (possibly zero) ramp so the driver gets the correct
+                    // neutral curve after the mode switch resets gamma.
+                    apply_ramp(st, hwnd);
+                }
+
                 if st.dimmer.enabled {
                     st.dimmer.start_reposition_overlays();
                 }
-                // Same fix as WM_SIZE: RDW_UPDATENOW forces the composited
-                // backbuffer to flush synchronously.  Without it, WS_EX_COMPOSITED
-                // leaves the stale frame visible until the next input event.
                 RedrawWindow(hwnd, None, None,
                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
             }
             LRESULT(0)
         }
 
-        WM_SHOWWINDOW if wparam.0 != 0 => {
-            if let Some(st) = borrow_state::<AppState>(hwnd) {
-                if !st.layout_initialized {
-                        app_layout::apply(st, hwnd);
-                        // Install zoom icons — deferred from WM_CREATE to avoid
-                        // borrow conflict while create_state still holds a mutable ref.
-                        crate::ui_drawing::install_bitmap_static(
-                            st.crush.h_lbl_zoom_out_icon, st.nav_icons.zoom_out);
-                        crate::ui_drawing::install_bitmap_static(
-                            st.crush.h_lbl_zoom_icon, st.nav_icons.zoom);
-                    }
-                let (pw, ph) = client_size_of(st.crush.h_hdr_panel);
-                st.crush.hdr_panel.init_d3d(st.crush.h_hdr_panel, pw as u32, ph as u32);
-                st.crush.hdr_panel.update(get_slider_val(st.crush.h_sld_black));
-                st.crush.update_sl_hint();
-                st.crush.update_range_label();
-                st.crush.populate_refresh_rates(&mut st.ini);
-                // Initialise slider animation interval from the real display Hz
-                // now that the window is visible and the display is known.
-                update_slider_anim_interval(get_current_hz());
-                if !st.layout_initialized {
-                    st.layout_initialized = true;
-                }
-                maybe_restore_gamma(st, hwnd);
-                let args: Vec<String> = std::env::args().collect();
-                if args.iter().any(|a| a.eq_ignore_ascii_case("--minimized")) {
-                    st.crush.hdr_panel.suspend_d3d();
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-                let is_debug = args.iter().any(|a| a.eq_ignore_ascii_case("--debug"));
-                DEBUG_MODE.store(is_debug, Ordering::Relaxed);
-                if !is_debug_mode() {
-                    ShowWindow(st.h_nav_btn[3], SW_HIDE);
-                    KillTimer(hwnd, TIMER_DEBUG_REFRESH);
-                }
-            }
-            LRESULT(0)
+       
+
+     WM_SHOWWINDOW if wparam.0 != 0 => {
+    if let Some(st) = borrow_state::<AppState>(hwnd) {
+        let first_show = !st.layout_initialized;
+        if first_show {
+            app_layout::apply(st, hwnd);
+            crate::ui_drawing::install_bitmap_static(
+                st.crush.h_lbl_zoom_out_icon, st.nav_icons.zoom_out);
+            crate::ui_drawing::install_bitmap_static(
+                st.crush.h_lbl_zoom_icon, st.nav_icons.zoom);
         }
+        let (pw, ph) = client_size_of(st.crush.h_hdr_panel);  // ← moved before init_d3d
+        st.crush.hdr_panel.init_d3d(st.crush.h_hdr_panel, pw as u32, ph as u32);
+        // Always schedule a recheck after init_d3d.  DXGI colour-space data is
+        // unreliable during early startup AND can be stale after the device was
+        // suspended while hidden (covers both --minimized launches and every
+        // subsequent tray restore).  The 10-tick window (~1 s) is self-limiting
+        // and costs nothing when HDR status is already correct.
+        st.crush.hdr_panel.schedule_hdr_recheck();
+        st.crush.hdr_panel.update(get_slider_val(st.crush.h_sld_black));
+        st.crush.update_sl_hint();
+        st.crush.update_range_label();
+        st.crush.populate_refresh_rates(&mut st.ini);
+        update_slider_anim_interval(get_current_hz());
+        if !st.layout_initialized {
+            st.layout_initialized = true;
+        }
+        maybe_restore_gamma(st, hwnd);
+
+        // Only on first show — don't re-trigger on every tray restore
+        if first_show {
+            let args: Vec<String> = std::env::args().collect();
+            let is_debug = args.iter().any(|a| a.eq_ignore_ascii_case("--debug"));
+            DEBUG_MODE.store(is_debug, Ordering::Relaxed);
+            if !is_debug_mode() {
+                ShowWindow(st.h_nav_btn[3], SW_HIDE);
+                KillTimer(hwnd, TIMER_DEBUG_REFRESH);
+            }
+        }
+    }
+    LRESULT(0)
+}
 
         WM_SIZE => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
@@ -692,11 +686,17 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                         st.nvidia_cam_enabled = CrushTab::is_nvidia_cam_enabled();
                         maybe_restore_gamma(st, hwnd);
                         
-                        // Note: We also want to reset the timer to 2000ms just in case 
-                        // the user clicked the toggle button (which temporarily sets it to 300ms)
                         SetTimer(hwnd, TIMER_HDR, 2000, None);
                     }
-                    TIMER_RENDER if ui_visible => { st.crush.hdr_panel.render_tick(); }
+                    TIMER_RENDER if ui_visible => {
+                        if st.crush.hdr_panel.render_tick() {
+                            // HDR status changed during a retry tick (e.g. after a toggle or display change).
+                            st.crush.update_sl_hint();
+                            st.crush.update_range_label();
+                            if !st.crush.previewing { apply_ramp(st, hwnd); }
+                            InvalidateRect(st.h_btn_hdr_toggle, None, true);
+                        }
+                    }
                     TIMER_OVERLAY_FADE  => { st.dimmer.tick_fade(); }
                     TIMER_DEBUG_REFRESH => {
                         // Timer only runs while tab 3 is active (armed/killed in
@@ -726,13 +726,14 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                         st.dimmer.tick_reposition();
                     }
                     TIMER_RAMP_APPLY => {
-                        // Debounce: black-level slider moved recently.
-                        // Apply the ramp once at ~20 Hz instead of on every drag tick.
                         KillTimer(hwnd, TIMER_RAMP_APPLY);
                         if st.ramp_dirty {
                             st.ramp_dirty = false;
                             apply_ramp(st, hwnd);
                         }
+                    }
+                    TIMER_CURSOR_HIDE => {
+                        st.system.on_cursor_hide_tick(hwnd);
                     }
                     _ => {}
                 }
@@ -753,9 +754,6 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
         WM_HSCROLL | WM_VSCROLL => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 let ctrl        = HWND(lparam.0 as *mut _);
-                // TB_THUMBPOSITION (0x4) or TB_ENDTRACK (0x8) indicate a final
-                // thumb release/commit on the trackbar.  TB_THUMBPOSITION occurs on
-                // direct thumb positioning as well as keyboard/drag commit.
                 let notify_code = (wparam.0 & 0xFFFF) as u32;
                 let is_end_track = matches!(notify_code, 0x4 | 0x8); // TB_THUMBPOSITION | TB_ENDTRACK
 
@@ -806,7 +804,12 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
         WM_DRAWITEM => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 let di = &*(lparam.0 as *const DRAWITEMSTRUCT);
-                if di.hwndItem == st.crush.h_ddl_refresh {
+                if di.hwndItem == st.crush.h_ddl_refresh
+                    || di.hwndItem == st.system.h_ddl_screen_timeout
+                    || di.hwndItem == st.system.h_ddl_sleep_timeout
+                    || di.hwndItem == st.system.h_ddl_screensaver
+                    || di.hwndItem == st.system.h_ddl_cursor_hide
+                {
                     ui_drawing::draw_combo_item(di);
                 } else if di.hwndItem == st.h_nav_btn[0] {
                     draw_nav_item(di, st.active_tab == 0,
@@ -820,20 +823,26 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                         !GetPropW(st.h_nav_btn[1], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "⊞",
                         st.nav_icons.dimmer);
-                } else if di.hwndItem == st.h_nav_btn[2] {
+                } else if di.hwndItem == st.h_nav_btn[5] {
                     draw_nav_item(di, st.active_tab == 2,
+                        GetFocus() == st.h_nav_btn[5],
+                        !GetPropW(st.h_nav_btn[5], NAV_BTN_HOVER_PROP).0.is_null(),
+                        HICON(ptr::null_mut()), "⚙",
+                        st.nav_icons.system);
+                } else if di.hwndItem == st.h_nav_btn[2] {
+                    draw_nav_item(di, st.active_tab == 3,
                         GetFocus() == st.h_nav_btn[2],
                         !GetPropW(st.h_nav_btn[2], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "⌨",
                         st.nav_icons.hotkeys);
                 } else if di.hwndItem == st.h_nav_btn[3] {
-                    draw_nav_item(di, st.active_tab == 3,
+                    draw_nav_item(di, st.active_tab == 4,
                         GetFocus() == st.h_nav_btn[3],
                         !GetPropW(st.h_nav_btn[3], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "🐛",
                         st.nav_icons.debug);
                 } else if di.hwndItem == st.h_nav_btn[4] {
-                    draw_nav_item(di, st.active_tab == 4,
+                    draw_nav_item(di, st.active_tab == 5,
                         GetFocus() == st.h_nav_btn[4],
                         !GetPropW(st.h_nav_btn[4], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "ℹ",
@@ -842,14 +851,18 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                     draw_dark_button_full(di,
                         st.debug.h_chk_suppress_fs, HWND(ptr::null_mut()),
                         HWND(ptr::null_mut()), HWND(ptr::null_mut()),
-                        st.dimmer.suppress_fs_enabled, false, false, false);
+                        st.dimmer.suppress_fs_enabled, false, false, false, false);
                 } else if di.hwndItem == st.debug.h_chk_suppress_ah {
                     draw_dark_button_full(di,
                         st.debug.h_chk_suppress_ah, HWND(ptr::null_mut()),
                         HWND(ptr::null_mut()), HWND(ptr::null_mut()),
-                        st.dimmer.suppress_ah_enabled, false, false, false);
+                        st.dimmer.suppress_ah_enabled, false, false, false, false);
                 } else if di.hwndItem == st.h_btn_hdr_toggle {
                     draw_hdr_toggle_switch(di, st.crush.hdr_panel.hdr_active, None);
+                } else if di.hwndItem == st.system.h_btn_taskbar_autohide {
+                    draw_hdr_toggle_switch(di, st.system.taskbar_autohide_state, None);
+                } else if di.hwndItem == st.system.h_ddl_screensaver {
+                    ui_drawing::draw_combo_item(di);
                 } else if st.hotkeys.is_pill(di.hwndItem) {
                     draw_hotkey_pill(di);
                 } else {
@@ -863,6 +876,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                         st.chk_startup_state,
                         st.dimmer.enabled,
                         st.crush.btn_toggle_active,
+                        false, // is_hovered
                     );
                 }
             }
@@ -919,7 +933,8 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                     ctrl == st.dimmer.h_lbl_fade_out_title ||
                     ctrl == st.debug.h_chk_suppress_fs     ||
                     ctrl == st.debug.h_chk_suppress_ah     ||
-                    ctrl == st.hotkeys.h_lbl_desc;
+                    ctrl == st.hotkeys.h_lbl_desc          ||
+                    ctrl == st.system.h_lbl_desc;
                 let is_hk_row_lbl = st.hotkeys.rows.iter().any(|r| r.h_lbl == ctrl);
                 SetBkColor(hdc, C_BG);
                 SetTextColor(hdc, if is_sub || is_hk_row_lbl { C_LABEL } else { C_FG });
@@ -928,7 +943,16 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             LRESULT(0)
         }
 
-        WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
+        WM_CTLCOLOREDIT => {
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                let hdc = HDC(wparam.0 as *mut _);
+                SetBkColor(hdc, C_BG3);
+                SetTextColor(hdc, C_FG);
+                return LRESULT(st.bg3_brush.0 as isize);
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLORBTN => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 let hdc = HDC(wparam.0 as *mut _);
                 SetBkColor(hdc, C_BG);
@@ -1062,6 +1086,10 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                         set_status(st, &msg, C_ACCENT);
                         InvalidateRect(st.dimmer.h_sld_taskbar_dim, None, false);
                     }
+                    HK_TOGGLE_HDR => {
+                        toggle_hdr_via_shortcut();
+                        st.crush.hdr_panel.schedule_hdr_recheck();
+                    }
                     x if x == HK_DEBUG_FORCE_RAISE as usize && is_debug_mode() => {
                         st.dimmer.force_raise_overlays();
                         set_status(st, "Overlays force-raised (debug)", C_ACCENT);
@@ -1073,9 +1101,28 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
         }
 
         WM_POWERBROADCAST => {
-            if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize {
-                if let Some(st) = borrow_state::<AppState>(hwnd) {
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize {
                     if !st.crush.previewing { apply_ramp(st, hwnd); }
+                } else if wparam.0 == PBT_POWERSETTINGCHANGE as usize {
+                    // lparam points to a POWERBROADCAST_SETTING struct whose
+                    // PowerSetting field is the GUID of the changed setting.
+                    // Re-read whichever timeout changed and update its dropdown.
+                    let pbs = &*(lparam.0 as *const POWERBROADCAST_SETTING);
+                    let guid = pbs.PowerSetting;
+                    if guid == crate::tab_system::GUID_VIDEO_POWERDOWN_TIMEOUT {
+                        let idx = crate::tab_system::read_screen_timeout()
+                            .map(crate::tab_system::timeout_to_index).unwrap_or(0);
+                        st.system.screen_timeout_idx = idx;
+                        SendMessageW(st.system.h_ddl_screen_timeout,
+                            CB_SETCURSEL, WPARAM(idx), LPARAM(0));
+                    } else if guid == crate::tab_system::GUID_STANDBY_TIMEOUT {
+                        let idx = crate::tab_system::read_sleep_timeout()
+                            .map(crate::tab_system::timeout_to_index).unwrap_or(0);
+                        st.system.sleep_timeout_idx = idx;
+                        SendMessageW(st.system.h_ddl_sleep_timeout,
+                            CB_SETCURSEL, WPARAM(idx), LPARAM(0));
+                    }
                 }
             }
             LRESULT(0)
@@ -1093,7 +1140,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
 
         WM_TRAY_CALLBACK => {
             match lparam.0 as u32 {
-                x if x == WM_LBUTTONDBLCLK => {
+                x if x == WM_LBUTTONUP => {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
                 }
@@ -1126,7 +1173,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
         WM_EXITSIZEMOVE => {
             // Resize finished — restart the debug timer if we're still on tab 3.
             if let Some(st) = borrow_state::<AppState>(hwnd) {
-                if is_debug_mode() && st.active_tab == 3 {
+                if is_debug_mode() && st.active_tab == 4 {
                     SetTimer(hwnd, TIMER_DEBUG_REFRESH, 500, None);
                 }
             }
@@ -1178,6 +1225,11 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                 KillTimer(hwnd, TIMER_STATUS_CLEAR);
                 KillTimer(hwnd, TIMER_FULLSCREEN_RECHECK);
                 KillTimer(hwnd, TIMER_RAMP_APPLY);
+                KillTimer(hwnd, TIMER_CURSOR_HIDE);
+                // Restore system cursors if they were hidden at exit time.
+                if st.system.cursor_is_hidden() {
+                    crate::tab_system::restore_system_cursors();
+                }
                 WTSUnRegisterSessionNotification(hwnd);
                 gamma_ramp::reset_display_ramp();
                 crate::tab_debug::uninstall_mouse_hook();
@@ -1193,7 +1245,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
                 DeleteObject(HGDIOBJ(st._font_title.0));
                 DeleteObject(HGDIOBJ(st._font_bold_val.0));
             }
-            for id in [HK_TOGGLE_DIM, HK_TOGGLE_CRUSH, HK_HOLD_COMPARE, HK_DECREASE, HK_INCREASE, HK_DIM_DECREASE, HK_DIM_INCREASE] {
+            for id in [HK_TOGGLE_DIM, HK_TOGGLE_CRUSH, HK_HOLD_COMPARE, HK_DECREASE, HK_INCREASE, HK_DIM_DECREASE, HK_DIM_INCREASE, HK_TOGGLE_HDR] {
                 UnregisterHotKey(hwnd, id as i32);
             }
             detach_state::<AppState>(hwnd);
@@ -1228,7 +1280,33 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             LRESULT(0)
         }
 
-        WM_NOTIFY => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_NOTIFY => {
+            // UDN_DELTAPOS fires *before* UDS_SETBUDDYINT updates the edit text.
+            // Read the edit text directly so a manually-typed value is respected,
+            // then apply iDelta relative to that — not the stale nm.iPos.
+            let hdr = &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR);
+            if hdr.code == windows::Win32::UI::Controls::UDN_DELTAPOS as u32 {
+                #[repr(C)]
+                struct NMUPDOWN { hdr: windows::Win32::UI::Controls::NMHDR, iPos: i32, iDelta: i32 }
+                let nm = &*(lparam.0 as *const NMUPDOWN);
+                if let Some(st) = borrow_state::<AppState>(hwnd) {
+                    // Read whatever the user has typed into the edit box.
+                    let mut buf = [0u16; 8];
+                    let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                        st.system.h_edt_ss_timeout, &mut buf) as usize;
+                    let typed: i32 = String::from_utf16_lossy(&buf[..len])
+                        .trim().parse().unwrap_or(nm.iPos);
+                    let new_val = (typed + nm.iDelta).clamp(1, 999) as u32;
+                    let msg = st.system.on_ss_timeout_set(new_val);
+                    if !msg.is_empty() { set_status(st, &msg, C_ACCENT); }
+                }
+                // Return 1 to cancel the spin's own position update — we have
+                // already applied it above. Without this, DefWindowProcW lets
+                // the updown apply the delta a second time (double-increment).
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
 
         WM_MOUSEWHEEL => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
@@ -1256,6 +1334,7 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        
 
         WM_MOUSE_CLICK_LOG => {
             // The WH_MOUSE_LL hook is only active while the debug tab is shown,
@@ -1269,6 +1348,21 @@ if let Some(st) = borrow_state::<AppState>(hwnd) {
             let y   = (raw & 0xFFFF_FFFF) as i32;
             crate::tab_debug::log_mouse_click(btn, POINT { x, y });
             LRESULT(0)
+        }
+
+        // Restore hidden cursor instantly on any mouse activity — WM_SETCURSOR
+        // fires on the UI thread the moment the cursor moves over any window,
+        // so this covers the whole screen without needing a hook.
+        // The atomic check costs ~1 cycle when the cursor is already visible.
+        WM_SETCURSOR => {
+            if crate::tab_system::CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::tab_system::CURSOR_HIDDEN.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Some(st) = borrow_state::<AppState>(hwnd) {
+                    st.system.cursor_hidden = false;
+                    crate::tab_system::restore_system_cursors();
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -1324,10 +1418,11 @@ unsafe fn create_state(hwnd: HWND, ini_path: PathBuf) -> AppState {
 
     let h_nav_btn_0 = cb.button(w!("Black Crush Tweak"), IDC_NAV_BTN_0);
     let h_nav_btn_1 = cb.button(w!("Taskbar Dimmer"),    IDC_NAV_BTN_1);
+    let h_nav_btn_5 = cb.button(w!("System"),            IDC_NAV_BTN_5);
     let h_nav_btn_2 = cb.button(w!("Hotkeys"),           IDC_NAV_BTN_2);
     let h_nav_btn_3 = cb.button(w!("Debug"),             IDC_NAV_BTN_3);
     let h_nav_btn_4 = cb.button(w!("About"),             IDC_NAV_BTN_4);
-    let h_nav_btn = [h_nav_btn_0, h_nav_btn_1, h_nav_btn_2, h_nav_btn_3, h_nav_btn_4];
+    let h_nav_btn = [h_nav_btn_0, h_nav_btn_1, h_nav_btn_2, h_nav_btn_3, h_nav_btn_4, h_nav_btn_5];
     for &h in &h_nav_btn {
         SetWindowSubclass(h, Some(nav_btn_subclass_proc), 1, 0);
     }
@@ -1362,14 +1457,34 @@ let hotkeys = HotkeysTab::new(
 );
 
     let debug = DebugTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
+    let mut system = SystemTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
+    SetWindowSubclass(system.h_btn_taskbar_autohide, Some(hdr_toggle_subclass_proc), 5, 0);
+
+    // ── Restore cursor-hide setting from INI ──────────────────────────────────
+    // Initialise the idle clock immediately so the first timer tick doesn't fire
+    // at t=0 (which would be 49 days of idle on a freshly booted machine).
+    crate::tab_system::cursor_touch();
+    {
+        let secs: u32 = ini.read("Mouse", "CursorHideSeconds", "0")
+            .parse().unwrap_or(0);
+        let idx = crate::tab_system::cursor_hide_to_index(secs);
+        system.cursor_hide_idx = idx;
+        SendMessageW(system.h_ddl_cursor_hide, CB_SETCURSEL, WPARAM(idx), LPARAM(0));
+        // Timer is armed below after state is fully built.
+    }
     let about = AboutTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
+
+    // ── Hover tracking for owner-drawn buttons/checkboxes ─────────────────────
+    install_action_btn_hover(crush.h_btn_toggle);
+    install_action_btn_hover(h_btn_quit);
+    install_action_btn_hover(h_btn_minimize);
 
     let nav_icons         = crate::nav_icons::NavIcons::load(dpi);
     let tab_header_icons  = crate::nav_icons::TabHeaderIcons::load(dpi);
 
     let mut state = AppState {
         hwnd,
-        crush, dimmer, hotkeys, debug, about,
+        crush, dimmer, system, hotkeys, debug, about,
         h_chk_startup, h_btn_quit, h_btn_minimize, h_btn_hdr_toggle,
         h_lbl_status, h_lbl_error, h_sep_vert, h_sep_h, h_nav_btn,
         h_app_icon, active_tab: 0,
@@ -1383,7 +1498,7 @@ let hotkeys = HotkeysTab::new(
         chk_startup_state: false,
         layout_initialized: false,
         zorder_winevent_hooks: None,
-        mouse_hotkeys: [0u32; 8],
+        mouse_hotkeys: [0u32; 9],
         nvidia_cam_enabled: unsafe { CrushTab::is_nvidia_cam_enabled() },
         ramp_dirty: false,
     };
@@ -1428,6 +1543,7 @@ let hotkeys = HotkeysTab::new(
     // Attach PNG icon painter to each tab's title label.
     ui_drawing::subclass_tab_header(state.crush.h_lbl_title,   state.tab_header_icons.crush);
     ui_drawing::subclass_tab_header(state.dimmer.h_lbl_dim_title, state.tab_header_icons.dimmer);
+    ui_drawing::subclass_tab_header(state.system.h_lbl_title,  state.tab_header_icons.system);
     ui_drawing::subclass_tab_header(state.hotkeys.h_lbl_title, state.tab_header_icons.hotkeys);
     ui_drawing::subclass_tab_header(state.debug.h_lbl_title,   state.tab_header_icons.debug);
     ui_drawing::subclass_tab_header(state.about.h_lbl_title,  state.tab_header_icons.about);
@@ -1435,6 +1551,12 @@ let hotkeys = HotkeysTab::new(
 
     tray::add_tray_icon(hwnd, hinstance, &mut state.tray_added);
     register_hotkeys(&state.ini, &mut state.mouse_hotkeys, hwnd);
+
+    // Arm the cursor-hide timer if the persisted setting is active.
+    if state.system.cursor_hide_idx > 0 {
+        SetTimer(hwnd, TIMER_CURSOR_HIDE, 1000, None);
+    }
+
     state
 }
 
@@ -1480,16 +1602,18 @@ unsafe fn show_tab(st: &mut AppState, hwnd: HWND) {
     let show_dim_controls = tab == 1 && st.dimmer.enabled;
     st.dimmer.grp_dim_controls.set_visible(show_dim_controls);
 
-    st.hotkeys.group.set_visible(tab == 2);
-    st.debug.group.set_visible(tab == 3);
-    st.about.group.set_visible(tab == 4);
+    st.system.group.set_visible(tab == 2);
+
+    st.hotkeys.group.set_visible(tab == 3);
+    st.debug.group.set_visible(tab == 4);
+    st.about.group.set_visible(tab == 5);
 
     // Arm TIMER_DEBUG_REFRESH only while the debug tab is visible (and only in
     // --debug mode — is_debug_mode() is false in production so the timer is
     // never started there at all).  Kill it when switching to any other tab so
     // the 500 ms wakeup disappears the moment the user leaves the debug tab.
     if is_debug_mode() {
-        if tab == 3 {
+        if tab == 4 {
             SetTimer(hwnd, TIMER_DEBUG_REFRESH, 500, None);
             crate::tab_debug::install_mouse_hook(hwnd);
             crate::tab_debug::install_debug_hotkeys(hwnd);
@@ -1525,9 +1649,10 @@ fn nav_btn_to_tab(id: usize) -> Option<usize> {
     match id {
         IDC_NAV_BTN_0 => Some(0),
         IDC_NAV_BTN_1 => Some(1),
-        IDC_NAV_BTN_2 => Some(2),
-        IDC_NAV_BTN_3 => Some(3),
-        IDC_NAV_BTN_4 => Some(4),
+        IDC_NAV_BTN_5 => Some(2), // System
+        IDC_NAV_BTN_2 => Some(3), // Hotkeys
+        IDC_NAV_BTN_3 => Some(4), // Debug
+        IDC_NAV_BTN_4 => Some(5), // About
         _ => None,
     }
 }
@@ -1538,6 +1663,36 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
     match id {
         IDC_ABOUT_BTN_CHECK if notify == BN_CLICKED as u32 => {
             st.about.on_check_updates();
+        }
+        IDC_SYS_BTN_TASKBAR_AUTOHIDE if notify == BN_CLICKED as u32 => {
+            let msg = st.system.on_toggle_taskbar_autohide();
+            set_status(st, msg, C_ACCENT);
+        }
+        IDC_SYS_DDL_SCREEN_TIMEOUT if notify == CBN_SELCHANGE as u32 => {
+            let msg = st.system.on_screen_timeout_changed();
+            set_status(st, &msg, C_ACCENT);
+        }
+        IDC_SYS_DDL_SLEEP_TIMEOUT if notify == CBN_SELCHANGE as u32 => {
+            let msg = st.system.on_sleep_timeout_changed();
+            set_status(st, &msg, C_ACCENT);
+        }
+        IDC_SYS_DDL_SCREENSAVER if notify == CBN_SELCHANGE as u32 => {
+            let msg = st.system.on_screensaver_changed();
+            set_status(st, &msg, C_ACCENT);
+        }
+        IDC_SYS_DDL_CURSOR_HIDE if notify == CBN_SELCHANGE as u32 => {
+            let msg = st.system.on_cursor_hide_changed(hwnd);
+            // Persist the new index to INI.
+            let secs = crate::tab_system::CURSOR_HIDE_OPTIONS
+                .get(st.system.cursor_hide_idx)
+                .map(|&(_, s)| s)
+                .unwrap_or(0);
+            st.ini.write("Mouse", "CursorHideSeconds", &secs.to_string());
+            set_status(st, msg, C_ACCENT);
+        }
+        IDC_SYS_EDT_SS_TIMEOUT if notify == 0x0200 => { // EN_KILLFOCUS
+            let msg = unsafe { st.system.commit_ss_timeout() };
+            if !msg.is_empty() { set_status(st, &msg, C_ACCENT); }
         }
         IDC_BTN_LOG_CLEAR => {
             st.debug.on_log_clear();
@@ -1552,6 +1707,7 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
             let tab = nav_btn_to_tab(id).unwrap();
             if st.active_tab != tab {
                 st.active_tab = tab;
+                if tab == 2 { st.system.refresh(); }
                 show_tab(st, hwnd);
                 app_layout::apply(st, hwnd);
                 for h in &st.h_nav_btn { InvalidateRect(*h, None, false); }
@@ -1559,8 +1715,9 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
         }
         IDC_BTN_HDR_TOGGLE if notify == BN_CLICKED as u32 => {
             toggle_hdr_via_shortcut();
-            // Re-query HDR state after a short delay so the button redraws correctly.
-            SetTimer(hwnd, TIMER_HDR, 300, None);
+            // Start the HDR retry sequence.  Windows needs time to settle after
+            // the Win+Alt+B shortcut before is_any_monitor_hdr() sees the change.
+            st.crush.hdr_panel.schedule_hdr_recheck();
         }
         IDC_BTN_QUIT     => { tray::remove_tray_icon(hwnd, st.tray_menu, &mut st.tray_added); DestroyWindow(hwnd); }
         IDC_BTN_MINIMIZE => { st.crush.hdr_panel.suspend_d3d(); ShowWindow(hwnd, SW_HIDE); }
@@ -1639,6 +1796,7 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
        
         // Clear button — clear the row then auto-save + re-register.
         id if (IDC_HK_CLR_TOGGLE_DIMMER..=IDC_HK_CLR_DIM_INCREASE).contains(&id)
+            || id == IDC_HK_CLR_TOGGLE_HDR
             && notify == BN_CLICKED as u32 =>
         {
             st.hotkeys.clear_row_by_id(id);
@@ -1648,6 +1806,7 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
         }
         // Pill sent EN_CHANGE after key captured — auto-save + re-register.
         id if (IDC_HK_EDT_TOGGLE_DIMMER..=IDC_HK_EDT_DIM_INCREASE).contains(&id)
+            || id == IDC_HK_EDT_TOGGLE_HDR
             && notify == EN_CHANGE as u32 =>
         {
             st.hotkeys.save(&mut st.ini);

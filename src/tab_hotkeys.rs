@@ -32,7 +32,7 @@ use crate::{
     constants::*,
     controls::ControlBuilder,
     profile_manager::ProfileManager,
-    ui_drawing::get_accent_color,
+    ui_drawing::{get_accent_color, install_action_btn_hover},
     win32::ControlGroup,
 };
 
@@ -181,6 +181,8 @@ pub const PROP_HK_RECORDING: PCWSTR = w!("BCT_HkRecording");
 /// Heap-allocated UTF-16 string snapshot of the text at focus-gain, used to
 /// restore on cancel (click-away without pressing a key).
 const PROP_HK_SAVED_TEXT: PCWSTR = w!("BCT_HkSavedText");
+/// Non-null while the cursor is hovering over the pill (used by draw_hotkey_pill).
+const PROP_HK_HOVERED: PCWSTR = w!("BCT_HkHovered");
 
 // ── Pill-button subclass proc ──────────────────────────────────────────────────
 //
@@ -290,6 +292,28 @@ pub unsafe extern "system" fn hotkey_pill_subclass_proc(
             LRESULT(0)
         }
 
+        WM_MOUSEMOVE => {
+            // Start tracking so we get WM_MOUSELEAVE when the cursor exits.
+            if GetPropW(hwnd, PROP_HK_HOVERED).0.is_null() {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize:      std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags:     TME_LEAVE,
+                    hwndTrack:   hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut tme);
+                SetPropW(hwnd, PROP_HK_HOVERED, HANDLE(1 as *mut _));
+                InvalidateRect(hwnd, None, false);
+            }
+            call_orig()
+        }
+
+        WM_MOUSELEAVE => {
+            RemovePropW(hwnd, PROP_HK_HOVERED);
+            InvalidateRect(hwnd, None, false);
+            call_orig()
+        }
+
         WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => LRESULT(0),
 
         // Middle-click and extra buttons (Mouse4…Mouse19) can be bound while recording.
@@ -395,6 +419,7 @@ pub unsafe extern "system" fn hotkey_pill_subclass_proc(
             }
             RemovePropW(hwnd, PROP_HK_FOCUSED);
             RemovePropW(hwnd, PROP_HK_RECORDING);
+            RemovePropW(hwnd, PROP_HK_HOVERED);
             call_orig()
         }
 
@@ -457,6 +482,7 @@ mod draw {
         let focused   = !GetPropW(di.hwndItem, PROP_HK_FOCUSED).0.is_null();
         let recording = !GetPropW(di.hwndItem, PROP_HK_RECORDING).0.is_null();
         let pressed   = di.itemState.0 & ODS_SELECTED.0 != 0;
+        let hovered   = !GetPropW(di.hwndItem, PROP_HK_HOVERED).0.is_null();
 
         let dpi = GetDeviceCaps(hdc, LOGPIXELSX).max(96);
         let s   = |px: i32| (px * dpi / 96).max(1);
@@ -464,17 +490,18 @@ mod draw {
         let accent = get_accent_color();
 
         // ── Background ────────────────────────────────────────────────────────
-        // Slightly lighter when pressed to give tactile feedback.
-        let bg_color = if pressed { COLORREF(0x00323232) } else { COLORREF(0x002A2A2A) };
+        // Lighten slightly on hover; lighter still when pressed.
+        let bg_color = if pressed       { COLORREF(0x00404040) }
+                       else if hovered  { COLORREF(0x00363636) }
+                       else             { COLORREF(0x002A2A2A) };
         let bg_br    = CreateSolidBrush(bg_color);
         FillRect(hdc, &rc, bg_br);
         DeleteObject(bg_br);
 
         // ── Rounded-rect border ───────────────────────────────────────────────
-        // Always draw a subtle 1px grey border; the pill is compact, not
-        // full-radius — use a small fixed corner radius (~6 dp) instead.
+        // Always draw a subtle 1px border; brighten it on hover.
         let radius = s(6);
-        let border_color = COLORREF(0x00484848);
+        let border_color = if hovered { COLORREF(0x00666666) } else { COLORREF(0x00484848) };
         let pen    = CreatePen(PS_SOLID, 1, border_color);
         let old_p  = SelectObject(hdc, pen);
         let old_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -555,8 +582,10 @@ pub struct HotkeysTab {
     pub h_lbl_desc:        HWND,
     pub h_lbl_sect_dimmer: HWND,
     pub h_lbl_sect_crush:  HWND,
-    pub h_sep_sect: [HWND; 2],
-    pub rows: [HotkeyRow; 7],
+    #[allow(dead_code)]
+    pub h_lbl_sect_system: HWND,
+    pub h_sep_sect: [HWND; 3],
+    pub rows: [HotkeyRow; 8],
     pub h_sep_bottom: HWND,
     pub group: ControlGroup,
 }
@@ -588,13 +617,15 @@ impl HotkeysTab {
         let h_sep_sect0       = cb.static_text(w!(""), SS_BLACKRECT);
         let h_lbl_sect_crush  = cb.static_text(w!("Black Crush Tweak"), SS_NOPREFIX);
         let h_sep_sect1       = cb.static_text(w!(""), SS_BLACKRECT);
+        let h_lbl_sect_system = cb.static_text(w!("System"), SS_NOPREFIX);
+        let h_sep_sect2       = cb.static_text(w!(""), SS_BLACKRECT);
 
         // Section headings: 11pt bold — smaller than the 16pt tab title but
         // still distinct from the 10pt normal row labels.
         let font_sect = crate::ui_drawing::make_font_cached(w!("Segoe UI"), 11, dpi, true);
         SendMessageW(h_lbl_sect_dimmer, WM_SETFONT, WPARAM(font_sect.0 as usize), LPARAM(1));
         SendMessageW(h_lbl_sect_crush,  WM_SETFONT, WPARAM(font_sect.0 as usize), LPARAM(1));
-        // font_sect is cached and reused across DPI changes.
+        SendMessageW(h_lbl_sect_system, WM_SETFONT, WPARAM(font_sect.0 as usize), LPARAM(1));
 
 
         let make_row = |lbl_text: PCWSTR,
@@ -604,6 +635,7 @@ impl HotkeysTab {
             let initial = ini.read(sec, ini_key, "None");
             let h_edit  = Self::make_pill_button(&cb, id_edit, &initial);
             let h_clear = cb.button(w!("×"), id_clear);
+            install_action_btn_hover(h_clear);
             HotkeyRow { h_lbl, h_edit, h_clear, ini_key, clr_id: id_clear, edit_id: id_edit }
         };
 
@@ -622,6 +654,9 @@ impl HotkeysTab {
         let row6 = make_row(w!("Increase Dim Level"),
             IDC_HK_EDT_DIM_INCREASE,  IDC_HK_CLR_DIM_INCREASE,  "IncreaseDimLevel");
 
+        let row7 = make_row(w!("Toggle HDR/SDR"),
+            IDC_HK_EDT_TOGGLE_HDR, IDC_HK_CLR_TOGGLE_HDR, "ToggleHDR");
+
         let h_sep_bottom = cb.static_text(w!(""), SS_BLACKRECT);
 
         let group = ControlGroup::new(vec![
@@ -635,14 +670,16 @@ impl HotkeysTab {
             row4.h_lbl, row4.h_edit, row4.h_clear,
             row5.h_lbl, row5.h_edit, row5.h_clear,
             row6.h_lbl, row6.h_edit, row6.h_clear,
+            h_lbl_sect_system, h_sep_sect2,
+            row7.h_lbl, row7.h_edit, row7.h_clear,
             h_sep_bottom,
         ]);
 
         Self {
             h_lbl_title, h_lbl_desc,
-            h_lbl_sect_dimmer, h_lbl_sect_crush,
-            h_sep_sect: [h_sep_sect0, h_sep_sect1],
-            rows: [row0, row1, row2, row3, row4, row5, row6],
+            h_lbl_sect_dimmer, h_lbl_sect_crush, h_lbl_sect_system,
+            h_sep_sect: [h_sep_sect0, h_sep_sect1, h_sep_sect2],
+            rows: [row0, row1, row2, row3, row4, row5, row6, row7],
             h_sep_bottom,
             group,
         }

@@ -14,6 +14,7 @@ mod nav_icons;
 mod profile_manager;
 mod tab_crush;
 mod tab_about;
+mod tab_system;
 mod tab_debug;
 mod tab_hotkeys;
 mod ui_drawing;

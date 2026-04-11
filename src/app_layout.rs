@@ -15,11 +15,12 @@ use crate::constants::*;
 
 pub unsafe fn apply(st: &mut crate::app::AppState, hwnd: HWND) {
     // Count of controls to reposition — over-estimate is fine, the OS clamps it.
-    const CTRL_COUNT: i32 = 82;
+    const CTRL_COUNT: i32 = 92;
     if let Some(mut grid) = LayoutGrid::new(hwnd, CTRL_COUNT) {
         grid.place_side_panel(st, hwnd);
         let _ = grid.place_black_crush_tab(st, hwnd);
         grid.place_taskbar_tab(st, hwnd);
+        grid.place_system_tab(st, hwnd);
         grid.place_hotkeys_tab(st, hwnd);
         grid.place_debug_tab(st, hwnd);
         grid.place_about_tab(st, hwnd);
@@ -99,15 +100,27 @@ impl LayoutGrid {
         let nav_h = self.s(38);
         let mut sy = self.s(14);
 
+        // Nav buttons: 0=Black Crush, 1=Taskbar Dimmer, 5=System, 2=Hotkeys, 4=About, 3=Debug.
+        // About (4) is always shown. Debug (3) only appears in debug mode, after About.
         self.set(st.h_nav_btn[0], 0, sy, self.side_w, nav_h);
         sy += nav_h;
         self.set(st.h_nav_btn[1], 0, sy, self.side_w, nav_h);
         sy += nav_h;
-        self.set(st.h_nav_btn[2], 0, sy, self.side_w, nav_h);
+        self.set(st.h_nav_btn[5], 0, sy, self.side_w, nav_h); // System
         sy += nav_h;
-        self.set(st.h_nav_btn[4], 0, sy, self.side_w, nav_h);
+        self.set(st.h_nav_btn[2], 0, sy, self.side_w, nav_h); // Hotkeys
         sy += nav_h;
-        self.set(st.h_nav_btn[3], 0, sy, self.side_w, nav_h);
+        self.set(st.h_nav_btn[4], 0, sy, self.side_w, nav_h); // About
+        sy += nav_h;
+
+        // Debug nav button (index 3): only takes up space in debug mode.
+        // In normal mode it is moved off-screen so it leaves no gap.
+        if crate::app::is_debug_mode() {
+            self.set(st.h_nav_btn[3], 0, sy, self.side_w, nav_h);
+            sy += nav_h;
+        } else {
+            self.set(st.h_nav_btn[3], -self.side_w - 1, 0, self.side_w, nav_h);
+        }
 
         let col_w = self.side_w - self.s(12) - self.s(8);
         let tog_h = self.s(28);
@@ -127,8 +140,8 @@ impl LayoutGrid {
         let mut y = self.s(8) + self.s(6);
 
         self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(36), st.crush.h_lbl_title,  self.s(2));
-        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(36), st.crush.h_lbl_sub1,   0);
-        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(36), st.crush.h_lbl_sub2,   self.s(14));
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20), st.crush.h_lbl_sub1,   self.s(4));
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20), st.crush.h_lbl_sub2,   self.s(14));
 
         // ── Black Level section ───────────────────────────────────────────────
         self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20), st.crush.h_lbl_bl_sect, self.s(4));
@@ -216,11 +229,11 @@ impl LayoutGrid {
     fn place_taskbar_tab(&mut self, st: &mut crate::app::AppState, _hwnd: HWND) {
         let mut dy = self.s(8) + self.s(6);
 
-        // Title then immediately the toggle — so the pill sits right next to the heading.
+        // Title then immediately the description, then the toggle below.
         self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(36), st.dimmer.h_lbl_dim_title,    self.s(4));
-        self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(28), st.dimmer.h_chk_taskbar_dim,  self.s(4));
-        // Sub-description as a small note below the toggle.
-        self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(40), st.dimmer.h_lbl_dim_sub,      self.s(10));
+        self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(40), st.dimmer.h_lbl_dim_sub,      self.s(4));
+        // Toggle pill below the description.
+        self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(28), st.dimmer.h_chk_taskbar_dim,  self.s(10));
 
         // ── "Dim Level" section ───────────────────────────────────────────────
         self.place_with_gap(&mut dy, self.main_x, self.main_w, self.s(20), st.dimmer.h_lbl_dim_sect, self.s(4));
@@ -257,6 +270,86 @@ impl LayoutGrid {
         let def_btn_w = self.s(160);
         self.set(st.dimmer.h_btn_dim_defaults,
             self.main_x + (self.main_w - def_btn_w) / 2, dy, def_btn_w, self.s(26));
+    }
+
+    fn place_system_tab(&mut self, st: &mut crate::app::AppState, _hwnd: HWND) {
+        let mut y = self.s(8) + self.s(6);
+ 
+        // ── Title ─────────────────────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(36),
+            st.system.h_lbl_title, self.s(2));
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.system.h_lbl_desc, self.s(10));
+
+        // Shared column metrics — hoisted so toggles align with dropdowns.
+        let pw_lbl_w       = self.s(160);
+        let pw_ddl_w       = self.s(110);
+        let pw_ddl_x       = self.main_x + pw_lbl_w + self.s(8);
+        let pw_row_h       = self.s(28);
+        let pw_ddl_popup_h = pw_row_h + self.s(220);
+
+        // pill geometry — same as used for night light previously.
+        let pill_w   = self.s(28) + self.s(2) * 2;
+        let tog_w    = (pw_ddl_x - self.main_x) + pill_w;
+        let tog_st_x = self.main_x + tog_w + self.s(10);
+        let tog_st_w = self.main_x + self.main_w - tog_st_x;
+
+        // ── "Display" section ─────────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.system.h_lbl_sect_display, self.s(4));
+        self.place_separator(&mut y, self.main_x, self.main_w,
+            st.system.h_sep_display);
+
+        self.set(st.system.h_btn_taskbar_autohide,    self.main_x, y, tog_w,    pw_row_h);
+        self.set(st.system.h_lbl_taskbar_autohide_st, tog_st_x,    y, tog_st_w, pw_row_h);
+        y += pw_row_h + self.s(14);
+
+        // ── "Power" section ───────────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.system.h_lbl_sect_power, self.s(4));
+        self.place_separator(&mut y, self.main_x, self.main_w,
+            st.system.h_sep_power);
+
+        self.set(st.system.h_lbl_screen_timeout, self.main_x, y, pw_lbl_w, pw_row_h);
+        self.set(st.system.h_ddl_screen_timeout, pw_ddl_x,    y, pw_ddl_w, pw_ddl_popup_h);
+        y += pw_row_h + self.s(10);
+
+        self.set(st.system.h_lbl_sleep_timeout,  self.main_x, y, pw_lbl_w, pw_row_h);
+        self.set(st.system.h_ddl_sleep_timeout,  pw_ddl_x,    y, pw_ddl_w, pw_ddl_popup_h);
+        y += pw_row_h + self.s(14);
+
+        // ── "Screensaver" section ─────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.system.h_lbl_sect_screensaver, self.s(4));
+        self.place_separator(&mut y, self.main_x, self.main_w,
+            st.system.h_sep_screensaver);
+
+        // Screensaver dropdown row: [label] [dropdown same width as power dropdowns]
+        self.set(st.system.h_lbl_screensaver,  self.main_x, y, pw_lbl_w, pw_row_h);
+        self.set(st.system.h_ddl_screensaver,  pw_ddl_x,    y, pw_ddl_w, pw_ddl_popup_h);
+        y += pw_row_h + self.s(10);
+
+        // Wait row: [Wait label] [edit at pw_ddl_x] [spin] [minutes label]
+        let ss_edit_w = self.s(38);
+        let ss_spin_w = self.s(18);
+        let ss_spin_x = pw_ddl_x + ss_edit_w;
+        let ss_mins_x = ss_spin_x + ss_spin_w + self.s(6);
+        let ss_mins_w = self.main_x + self.main_w - ss_mins_x;
+        self.set(st.system.h_lbl_ss_timeout, self.main_x, y, pw_lbl_w,  pw_row_h);
+        self.set(st.system.h_edt_ss_timeout, pw_ddl_x,    y, ss_edit_w, self.s(22));
+        self.set(st.system.h_spin_ss,        ss_spin_x,   y, ss_spin_w, self.s(22));
+        self.set(st.system.h_lbl_ss_minutes, ss_mins_x,   y, ss_mins_w, pw_row_h);
+        y += pw_row_h + self.s(14);
+
+        // ── "Mouse" section ───────────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.system.h_lbl_sect_mouse, self.s(4));
+        self.place_separator(&mut y, self.main_x, self.main_w,
+            st.system.h_sep_mouse);
+
+        self.set(st.system.h_lbl_cursor_hide, self.main_x, y, pw_lbl_w,  pw_row_h);
+        self.set(st.system.h_ddl_cursor_hide, pw_ddl_x,    y, pw_ddl_w,  pw_row_h + self.s(120));
+        // y not advanced — last row in this tab
     }
 
     fn place_hotkeys_tab(&mut self, st: &mut crate::app::AppState, _hwnd: HWND) {
@@ -310,6 +403,23 @@ impl LayoutGrid {
         // Rows 4–6: Toggle, Decrease, Increase Dim Level
         for i in 4..7 {
             let r = &st.hotkeys.rows[i];
+            self.set(r.h_lbl,   self.main_x, y, label_w, row_h);
+            self.set(r.h_edit,  edit_x,      y, edit_w,  row_h);
+            self.set(r.h_clear, clear_x,     y, clear_w, row_h);
+            y += row_h + row_gap;
+        }
+
+        y += self.s(6); // extra breathing room before next section
+
+        // ── System section ────────────────────────────────────────────────────
+        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+            st.hotkeys.h_lbl_sect_system, self.s(4));
+        self.place_separator(&mut y, self.main_x, self.main_w,
+            st.hotkeys.h_sep_sect[2]);
+
+        // Row 7: Toggle HDR/SDR
+        {
+            let r = &st.hotkeys.rows[7];
             self.set(r.h_lbl,   self.main_x, y, label_w, row_h);
             self.set(r.h_edit,  edit_x,      y, edit_w,  row_h);
             self.set(r.h_clear, clear_x,     y, clear_w, row_h);

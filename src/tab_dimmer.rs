@@ -1,8 +1,4 @@
-// tab_dimmer.rs — Taskbar Dimmer tab state, overlay windows, and fade animation.
-//
-// All business logic that was previously inline in app.rs under the
-// "Taskbar Dimmer" section has been extracted here into `DimmerTab`.
-//
+// tab_dimmer.rs — Taskbar Dimmer state, overlays, and animation.
 // Rendering helpers live in ui_drawing.rs.
 // Compile-time constants and IDs live in constants.rs.
 
@@ -32,12 +28,8 @@ use windows::{
 // ABS_AUTOHIDE is not re-exported by windows-rs Shell bindings — define locally.
 const ABS_AUTOHIDE: u32 = 0x0000_0001;
 
-// SWP_NOSENDCHANGING (0x0400) suppresses WM_WINDOWPOSCHANGING notifications to
-// other windows when we call SetWindowPos.  Without it, shell windows such as
-// OpenShell.CMenuContainer intercept the notification and synchronously
-// re-assert their own TOPMOST position *inside our SetWindowPos call*, causing
-// our overlay to appear displaced the instant it is raised.  Adding this flag
-// makes the Z-order change silent — we win the race because no one else is told.
+// SWP_NOSENDCHANGING prevents shell windows from re-asserting Z-order
+// during our SetWindowPos call.
 const SWP_NOSENDCHANGING: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(0x0400);
 
 // ── Refresh-rate-aware fade interval ─────────────────────────────────────────
@@ -47,11 +39,9 @@ const SWP_NOSENDCHANGING: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(0x0400);
 // the display refresh rate changes (WM_DISPLAYCHANGE or user selects a new rate
 // in the dropdown).  Using an atomic means app.rs can write it from the WndProc
 // without needing a mutable borrow of DimmerTab.
-pub static OVERLAY_FADE_INTERVAL_MS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(16);
+pub static OVERLAY_FADE_INTERVAL_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(16);
 
-/// Compute and store the correct fade timer interval for `hz`.
-/// Call this on startup, on WM_DISPLAYCHANGE, and after a refresh-rate change.
+/// Updates fade timer interval based on Hz.
 pub fn set_fade_interval_from_hz(hz: i32) {
     let interval = (1000u32 / (hz.max(30) as u32)).max(1);
     OVERLAY_FADE_INTERVAL_MS.store(interval, std::sync::atomic::Ordering::Relaxed);
@@ -60,16 +50,13 @@ pub fn set_fade_interval_from_hz(hz: i32) {
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS};
 
-// EVENT_OBJECT_SHOW (0x8002) — fires when any window / UI element becomes visible.
-// Used to detect shell panel pop-ups (Quick Settings, Action Center, etc.) that
-// displace our TOPMOST overlays.  Not re-exported by windows-rs Accessibility::*,
-// so we define it locally.
+// Fires when shell panels (Quick Settings, etc) displace our overlays.
 const EVENT_OBJECT_SHOW: u32 = 0x8002;
 
 use crate::{
     constants::*,
     profile_manager::ProfileManager,
-    ui_drawing::{get_slider_val, make_font, slider_subclass_proc, SetWindowSubclass},
+    ui_drawing::{get_slider_val, make_font, install_action_btn_hover, slider_subclass_proc, SetWindowSubclass},
     win32::ControlGroup,
 };
 
@@ -114,11 +101,10 @@ const CLS_WORKER_W: &[u16] = &CLS_WORKER_W_ARR;
 // notification hosts across Windows 10 / 11 variants.
 const CLS_CTRL_CENTER_ARR:  [u16; 19] = ascii_to_utf16(b"ControlCenterWindow");
 const CLS_XAML_HOST_ARR:    [u16; 28] = ascii_to_utf16(b"XamlExplorerHostIslandWindow");
-const CLS_ACTION_CTR_ARR:   [u16; 22] = ascii_to_utf16(b"ActionCenterExperience"); // Win10
+const CLS_ACTION_CTR_ARR:   [u16; 22] = ascii_to_utf16(b"ActionCenterExperience");
 const CLS_NOTIF_TOAST_ARR:  [u16; 26] = ascii_to_utf16(b"Windows.UI.Core.CoreWindow");
-const CLS_START_HOST_ARR:   [u16; 23] = ascii_to_utf16(b"StartMenuExperienceHost"); // not the outer frame
+const CLS_START_HOST_ARR:   [u16; 23] = ascii_to_utf16(b"StartMenuExperienceHost");
 
-// Lengths differ — we can't use a slice of slices directly, so keep individual refs.
 const CLS_CTRL_CENTER:  &[u16] = &CLS_CTRL_CENTER_ARR;
 const CLS_XAML_HOST:    &[u16] = &CLS_XAML_HOST_ARR;
 const CLS_ACTION_CTR:   &[u16] = &CLS_ACTION_CTR_ARR;
@@ -431,15 +417,10 @@ pub struct DimmerTab {
     /// so the debug log isn't flooded on every backup-interval tick.
     last_logged_zpos: Vec<u32>,
 
-    /// `GetTickCount64` deadline (ms) for the active reposition window.
-    /// When non-zero, `tick_reposition` will reposition overlays and check if time is up.
-    /// Set by `start_reposition_overlays` and cleared when the window expires.
+    /// Deadline for taskbar stabilization window.
     reposition_until_tick: u64,
 
-    /// True while overlays are hidden waiting for the taskbar to settle after a
-    /// display/DPI change.  `tick_fade` must not touch overlay windows while this
-    /// is set — any `SetWindowPos` or `SetLayeredWindowAttributes` call would
-    /// un-hide them at the wrong position before `tick_reposition` is done.
+    /// True while overlays are hidden waiting for taskbar to settle.
     pub is_repositioning: bool,
 }
 
@@ -486,10 +467,7 @@ pub unsafe fn install_zorder_winevent_hooks() -> ZOrderWinEventHooks {
         0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
     );
-    // EVENT_OBJECT_SHOW — fires when any window becomes visible.
-    // The proc filters immediately on class name so only known shell panels
-    // (Quick Settings, Action Center, etc.) trigger a re-raise.
-    // Cost at idle = zero: the filter bails before any allocation.
+
     let h_show = SetWinEventHook(
         EVENT_OBJECT_SHOW,
         EVENT_OBJECT_SHOW,
@@ -505,11 +483,7 @@ pub unsafe fn install_zorder_winevent_hooks() -> ZOrderWinEventHooks {
     ZOrderWinEventHooks { _hooks: hooks }
 }
 
-/// WinEvent proc for `EVENT_OBJECT_SHOW`.
-///
-/// Filters on class name with zero allocation — bails immediately for anything
-/// that isn't a known shell panel.  Only posts `WM_APP_RAISE_OVERLAYS` to the
-/// UI thread when a displacing window appears (Quick Settings, Action Center, …).
+/// WinEvent proc for shell panel detection.
 unsafe extern "system" fn object_show_proc(
     _hook: HWINEVENTHOOK,
     _event: u32,
@@ -519,19 +493,15 @@ unsafe extern "system" fn object_show_proc(
     _id_event_thread: u32,
     _event_time: u32,
 ) {
-    // idObject == OBJID_WINDOW (0) means it's a real window, not a sub-element.
-    // This halves the call rate with a single integer compare — no Win32 calls.
     if id_object != 0 { return; }
     if hwnd.0.is_null() { return; }
 
-    // Class-name check: stack buffer, no allocation, early-out on mismatch.
     let mut cls_buf = [0u16; 32];
     let cls_len = GetClassNameW(hwnd, &mut cls_buf) as usize;
     if cls_len == 0 || !is_displacing_shell_panel(&cls_buf[..cls_len]) {
         return;
     }
 
-    // It's a known offender — tell the UI thread to re-raise immediately.
     let main_raw = MAIN_HWND_FOR_HOOK.load(std::sync::atomic::Ordering::Relaxed);
     if main_raw != 0 {
         let _ = PostMessageW(
@@ -543,8 +513,7 @@ unsafe extern "system" fn object_show_proc(
     }
 }
 
-/// WinEvent proc for the zorder-related events (foreground change, minimize-end).
-/// Re-evaluates fullscreen and posts messages to the UI thread.
+/// WinEvent proc for foreground/minimize events.
 unsafe extern "system" fn zorder_winevent_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -554,9 +523,6 @@ unsafe extern "system" fn zorder_winevent_proc(
     _id_event_thread: u32,
     _event_time: u32,
 ) {
-    // Re-evaluate fullscreen on every foreground change or minimize-end.
-    // We post WM_APP+1 to the main window so the check happens on the UI
-    // thread (where we have access to DimmerTab) rather than in this hook.
     let main_raw = MAIN_HWND_FOR_HOOK.load(std::sync::atomic::Ordering::Relaxed);
     if main_raw != 0 {
         let _ = PostMessageW(
@@ -574,8 +540,6 @@ unsafe extern "system" fn zorder_winevent_proc(
             _                                  => ZLogKind::Other,
         };
 
-        // Resolve window class + title for richer log detail.
-        // Both calls are cheap (no heap alloc for class, short title cap).
         let detail = if !hwnd.0.is_null() {
             let mut cls_buf = [0u16; 64];
             let cls_len = GetClassNameW(hwnd, &mut cls_buf) as usize;
@@ -707,6 +671,7 @@ impl DimmerTab {
         let h_sld_fade_out       = mk_slider(IDC_SLD_FADE_OUT, 0, 2000, 50);
         let h_lbl_fade_out_val   = mk_static(w!("50 ms"), SS_CENTERIMAGE);
         let h_btn_dim_defaults   = mk_btn(w!("↺  Restore Defaults"), IDC_BTN_DIM_DEFAULTS);
+        install_action_btn_hover(h_btn_dim_defaults);
         let h_sld_taskbar_dim    = mk_slider(IDC_SLD_TASKBAR_DIM, 0, 100, 90);
 
         // Apply special fonts.
@@ -817,9 +782,7 @@ impl DimmerTab {
             overlay_fade_start_alpha,
             overlay_fade_in_ms:  saved_fade_in  as f32,
             overlay_fade_out_ms: saved_fade_out as f32,
-            // true = "suppress (hide) the overlay under this condition" — the
-            // expected default.  The debug-tab checkboxes also initialise as
-            // checked, so the flag and the visual are now consistent.
+            // Defaults: suppress (hide) overlay when fullscreen/auto-hide active.
             suppress_fs_enabled:   true,
             suppress_ah_enabled:   true,
             main_hwnd,
@@ -850,10 +813,6 @@ impl DimmerTab {
         RedrawWindow(
             self.h_chk_taskbar_dim, None, None,
             RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
-
-        // Do NOT call ShowWindow on dimmer sub-controls here.
-        // show_tab() in app.rs owns all tab visibility — calling ShowWindow
-        // directly would bleed controls onto whichever tab is currently active.
 
         ini.write_int("_state", "TaskbarDimEnabled", if self.enabled { 1 } else { 0 });
         let _ = self.on_dim_slider_changed(hwnd, ini);
@@ -891,17 +850,11 @@ impl DimmerTab {
             self.overlay_alpha_target  = alpha as f32;
 
             if self.taskbar_overlays.is_empty() {
-                // Overlays don't exist yet — full creation path needed.
-                // This calls EnumWindows + SetWindowPos for each taskbar,
-                // but only happens once (on first enable or after a display change).
                 dim_all_taskbars(&mut self.taskbar_overlays, alpha);
                 self.cached_taskbar_rects = collect_taskbar_rects();
                 cache_tray_hwnd();
                 self.start_fade_timer_if_needed();
             } else {
-                // Overlays already exist — just update the alpha directly.
-                // Skips EnumWindows, SetWindowPos, and overlay recreation entirely.
-                // This is the hot path hit on every pixel of slider drag.
                 if alpha != self.last_applied_alpha {
                     for &h in &self.taskbar_overlays {
                         if !h.0.is_null() {
@@ -1013,41 +966,15 @@ impl DimmerTab {
 
     /// Called on every `TIMER_OVERLAY_FADE` tick.
     ///
-    /// ## Performance strategy
-    /// * **Cached taskbar rects** — `EnumWindows` only runs on display-change or
-    ///   overlay-create, not here.  We iterate `cached_taskbar_rects` instead.
-    /// * **Dynamic timer rate** — 16 ms (60 fps) while the alpha is actively
-    ///   transitioning; 100 ms (idle polling) when fully settled.  This cuts
-    ///   steady-state CPU usage by ~90 %.
-    /// * **Alpha-change guard** — `SetLayeredWindowAttributes` (a DWM round-trip)
-    ///   is skipped when the rounded alpha hasn't changed since last call.
-    /// * **Decoupled heavy-API polling** — `SHAppBarMessage` (IPC with explorer),
-    ///   `GetGUIThreadInfo` (cross-thread sync), and the fullscreen check are
-    ///   only run every `HEAVY_POLL_EVERY_N_TICKS` idle ticks (~500 ms), not on
-    ///   every timer fire.  Hover detection (cursor rect check, no syscalls)
-    ///   remains responsive at the full idle rate.
-    /// * **WinEvent-backed fullscreen** — `fullscreen_active` is primarily
-    ///   maintained by `on_fullscreen_check` (WM_APP_FULLSCREEN_CHECK, posted by
-    ///   the WinEvent hook on foreground/minimize events).  We still re-poll in
-    ///   the heavy-tick to catch late-sizing windows (e.g. games that resize after
-    ///   becoming foreground), but no longer on every single tick.
+    /// Throttled logic for overlay alpha transitions and state polling.
     pub unsafe fn tick_fade(&mut self) {
         if self.taskbar_overlays.is_empty() { return; }
 
-        // While a reposition is in progress the overlays are intentionally
-        // hidden.  Skip ALL window manipulation here — any SetWindowPos or
-        // SetLayeredWindowAttributes call would un-hide them at the old/wrong
-        // position before tick_reposition has finished settling.
         if self.is_repositioning { return; }
 
-        // ── Determine whether the alpha is actively animating ─────────────────
-        // Computed up front so hover (cheap) can stay at full idle rate even
-        // while heavy-poll is throttled.
         let is_animating = (self.overlay_alpha_current - self.overlay_alpha_target).abs() > 0.1;
 
-        // ── Hover detection (uses rect cache — zero Win32 calls) ──────────────
-        // OPTIMIZATION 4: Skip entirely when overlay_alpha_full == 0 — if the
-        // dim level is zero there is nothing to hover-fade and no target to change.
+        // Hover detection via cached rects.
         let hovering = if self.overlay_alpha_full > 0.5 {
             let mut cursor = POINT::default();
             GetCursorPos(&mut cursor);
@@ -1059,32 +986,13 @@ impl DimmerTab {
             false
         };
 
-        // ── Heavy-API poll (throttled) ────────────────────────────────────────
-        // Run on every tick while animating (need fresh state for correct targets),
-        // otherwise throttled to every HEAVY_POLL_EVERY_N_TICKS idle ticks
-        // (~500 ms at 100 ms idle rate).  This eliminates the continuous IPC
-        // cost of SHAppBarMessage and the cross-thread sync of GetGUIThreadInfo
-        // during normal idle.
-        //
-        // OPTIMIZATION 2: Each heavy API call is wrapped in a guard so it is
-        // skipped entirely when its corresponding suppression feature is disabled.
-        // SHAppBarMessage is IPC with explorer.exe; GetGUIThreadInfo forces
-        // cross-thread sync — there is no point incurring either cost when the
-        // user has opted out of the suppression behaviour.
-        //
-        // OPTIMIZATION 3: fullscreen is no longer re-polled here on heavy ticks.
-        // `on_fullscreen_check` (WM_APP_FULLSCREEN_CHECK from the WinEvent hook)
-        // is the primary update path.  When the foreground changes, app.rs also
-        // arms TIMER_FULLSCREEN_RECHECK (~1 s one-shot) to catch late-sizing
-        // games, so we don't need to keep polling once per 500 ms forever.
+        // Throttled shell state polling.
         const HEAVY_POLL_EVERY_N_TICKS: u32 = 5;
 
         self.idle_heavy_tick = self.idle_heavy_tick.wrapping_add(1);
         let should_poll_heavy = is_animating || (self.idle_heavy_tick % HEAVY_POLL_EVERY_N_TICKS == 0);
 
         if should_poll_heavy {
-            // 1. Auto-hide taskbar: SHAppBarMessage(ABM_GETSTATE) does IPC with
-            //    explorer.exe — skip entirely when the feature is disabled.
             if self.suppress_ah_enabled {
                 let mut abd = APPBARDATA {
                     cbSize: mem::size_of::<APPBARDATA>() as u32,
@@ -1120,7 +1028,6 @@ impl DimmerTab {
             self.overlay_fade_start_time  = GetTickCount64();
             self.overlay_fade_start_alpha = self.overlay_alpha_current;
 
-            // Log the suppression-state change (only fires on transitions).
             if let Some(Ok(mut log)) = zorder_log().map(|m| m.lock()) {
                 let reason = match (hovering, fs_hiding, ah_hiding) {
                     (true,  _,     _    ) => "hover → fade out",
@@ -1159,17 +1066,10 @@ impl DimmerTab {
             self.overlay_alpha_current = self.overlay_alpha_target;
         }
 
-        // ── Apply to overlays ─────────────────────────────────────────────────
         let alpha = self.overlay_alpha_current.round() as u8;
         let alpha_changed = alpha != self.last_applied_alpha;
 
-        // OPTIMIZATION 1: Throttle SetWindowPos(HWND_TOPMOST) to
-        // Z_ORDER_BACKUP_INTERVAL_MS (5 s) during idle.  WinEvent hooks handle
-        // the real-time Z-order correction; the periodic backup is just a safety
-        // net for edge cases (e.g. a window that bypasses the hook).
-        // We still enforce immediately after an animation completes (alpha
-        // changed) — that covers the "game goes fullscreen → overlay hidden →
-        // game exits → overlay must re-assert TOPMOST" path.
+        // Periodic Z-order safety net.
         let now_ms = GetTickCount64();
         let zorder_due = alpha_changed || now_ms.wrapping_sub(self.last_zorder_enforce_tick)
             >= Z_ORDER_BACKUP_INTERVAL_MS as u64;
@@ -1180,7 +1080,6 @@ impl DimmerTab {
 
         for h in &self.taskbar_overlays {
             if h.0.is_null() { continue; }
-            // Only call into DWM when the alpha integer actually changed.
             if alpha_changed {
                 let _ = SetLayeredWindowAttributes(*h, COLORREF(0), alpha, LWA_ALPHA);
             }
@@ -1193,10 +1092,7 @@ impl DimmerTab {
             self.last_applied_alpha = alpha;
         }
 
-        // ── Dynamic timer rate ────────────────────────────────────────────────
-        // One frame at the current display refresh rate while animating or while
-        // the overlay is visible (so cursor-enter is detected within one frame).
-        // 100 ms only when the overlay is fully faded out — nothing to react to.
+        // Dynamic timer: fast while animating/visible, slow at idle.
         let overlay_visible = self.overlay_alpha_current > 0.5
             || self.overlay_alpha_full > 0.5;  // dimmer enabled but hovering
         let frame_ms = OVERLAY_FADE_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -1225,12 +1121,7 @@ impl DimmerTab {
         }
     }
 
-    /// Called from the main WndProc when `TIMER_FULLSCREEN_RECHECK` fires.
-    ///
-    /// This one-shot timer is armed by app.rs after every `on_fullscreen_check`
-    /// call.  It fires ~1 s later to catch games that resize *after*
-    /// EVENT_SYSTEM_FOREGROUND fires (late-sizing), without requiring a
-    /// continuous 500 ms polling loop.  Kill the timer after calling this.
+    /// Catch games that resize late after becoming foreground.
     pub unsafe fn on_fullscreen_recheck(&mut self) {
         if self.suppress_fs_enabled {
             self.fullscreen_active = is_fullscreen_on_monitor(GetForegroundWindow());
@@ -1259,12 +1150,7 @@ impl DimmerTab {
 
     // ── Reposition window (simple 5-second refresh on display/rate change) ─────
 
-    /// Hide overlays immediately and start polling for taskbar stabilisation.
-    ///
-    /// Call this on WM_DISPLAYCHANGE or refresh-rate change.  The overlays are
-    /// hidden instantly so they don't linger at the old position while the shell
-    /// taskbar is still reflowing.  tick_reposition() then polls every 100 ms
-    /// and shows the overlay once the taskbar rect has stopped changing.
+    /// Hide overlays and start polling for taskbar reflow stabilization.
     pub unsafe fn start_reposition_overlays(&mut self) {
         if self.taskbar_overlays.is_empty() { return; }
 
@@ -1290,11 +1176,7 @@ impl DimmerTab {
         let _ = SetTimer(self.main_hwnd, TIMER_OVERLAY_REPOSITION, 100, None);
     }
 
-    /// Called from the TIMER_OVERLAY_REPOSITION handler.
-    ///
-    /// Polls the taskbar rect every tick.  Once two consecutive samples return
-    /// the same rect (the shell has stopped reflowing), shows the overlay there
-    /// and kills the timer.  Falls back to showing after 5 s regardless.
+    /// Reposition logic: shows overlays once taskbar rect stops changing.
     pub unsafe fn tick_reposition(&mut self) {
         if !self.enabled || self.taskbar_overlays.is_empty() {
             KillTimer(self.main_hwnd, TIMER_OVERLAY_REPOSITION);
@@ -1335,7 +1217,6 @@ impl DimmerTab {
                 let _ = SetLayeredWindowAttributes(*h, COLORREF(0), alpha, LWA_ALPHA);
             }
 
-            // Re-assert Z-order after showing.
             raise_and_log_overlay_zpos(&self.taskbar_overlays, &mut self.last_logged_zpos);
             self.last_zorder_enforce_tick = now;
 
@@ -1357,29 +1238,18 @@ impl DimmerTab {
                 log.push(GetTickCount64(), ZLogKind::RepositionSafetyNet, n, detail);
             }
         } else {
-            // Taskbar still moving — keep polling at 100 ms.
             let _ = SetTimer(self.main_hwnd, TIMER_OVERLAY_REPOSITION, 100, None);
         }
     }
 
-    /// Immediately reposition all overlays to the current taskbar positions
-    /// using physical-pixel rects from `GetMonitorInfoW.rcMonitor`.
-    ///
-    /// `GetMonitorInfoW.rcMonitor` always returns physical pixels regardless of
-    /// the process DPI awareness or any ongoing DPI transition — making this safe
-    /// and correct to call synchronously inside `WM_DPICHANGED` and
-    /// `WM_DISPLAYCHANGE`, before the new DPI scale has settled.
-    ///
-    /// Also reconciles the overlay count if the number of monitors changed.
+    /// Synchronously sync overlays to physical monitor rects.
     pub unsafe fn reposition_overlays_now(&mut self) {
         if !self.enabled || self.taskbar_overlays.is_empty() { return; }
 
         let t0 = GetTickCount64();
 
-        // Re-enumerate taskbar rects in physical pixels (DPI-independent).
         self.cached_taskbar_rects = collect_taskbar_rects();
 
-        // Reconcile overlay count with current monitor count.
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         while self.taskbar_overlays.len() < self.cached_taskbar_rects.len() {
             let cls = w!("BCT_TaskbarOverlay");
@@ -1398,7 +1268,6 @@ impl DimmerTab {
             }
         }
 
-        // Reposition and show each overlay at its physical-pixel taskbar rect.
         let alpha = self.overlay_alpha_current.round() as u8;
         for (h, r) in self.taskbar_overlays.iter().zip(self.cached_taskbar_rects.iter()) {
             if h.0.is_null() { continue; }
@@ -1412,7 +1281,6 @@ impl DimmerTab {
         self.last_applied_alpha = alpha;
         cache_tray_hwnd();
 
-        // Log timing and outcome so the debug tab shows the full sequence.
         if let Some(Ok(mut log)) = zorder_log().map(|m| m.lock()) {
             let elapsed = GetTickCount64().wrapping_sub(t0);
             let n = self.cached_taskbar_rects.len() as u64;
@@ -1440,8 +1308,7 @@ impl DimmerTab {
 
 // ── Z-order position logger ───────────────────────────────────────────────────
 
-/// Walk the Z-order position of each overlay window.
-/// Returns a `Vec<u32>` of 1-based positions (u32::MAX = not found).
+/// Returns 1-based Z-order positions for each overlay.
 unsafe fn sample_overlay_zpos(overlays: &[HWND]) -> Vec<u32> {
     overlays.iter().map(|&ov| {
         if ov.0.is_null() { return u32::MAX; }
@@ -1492,9 +1359,6 @@ unsafe fn raise_and_log_overlay_zpos(overlays: &[HWND], last: &mut Vec<u32>) {
     let tick = GetTickCount64();
 
     for (idx, &found) in positions.iter().enumerate() {
-        // Skip if already at #1 (no displacement — nothing interesting).
-        // Skip if same as last logged pre-raise position (same displacement
-        // already recorded — only log again when the position changes).
         if found == 1 || found == last[idx] { continue; }
         last[idx] = found;
         let payload = ((idx as u64) << 32) | (found as u64);
@@ -1529,11 +1393,9 @@ unsafe fn collect_taskbar_rects() -> Vec<RECT> {
             let full = mi.rcMonitor;
             let work = mi.rcWork;
 
-            // If the work area is smaller than the monitor area, there is a taskbar.
             if full.left != work.left || full.top != work.top || 
                full.right != work.right || full.bottom != work.bottom 
             {
-                // Calculate the taskbar rect based on the difference
                 let mut tb_rect = RECT::default();
                 
                 if work.top > full.top { // Taskbar at TOP
@@ -1559,19 +1421,8 @@ unsafe fn collect_taskbar_rects() -> Vec<RECT> {
 }
 
 fn dim_level_to_alpha(level: i32) -> u8 {
-    // Piecewise curve: quadratic ease-in from 0–60%, linear from 60–100%.
-    //
-    // A pure quadratic compresses the top end so severely that levels 96–99
-    // all round to 255 and become indistinguishable.  Switching to a linear
-    // ramp above the split point spreads those 40 steps evenly across
-    // alpha 214–255, guaranteeing a distinct value at every slider tick:
-    //   96 → 251 · 97 → 252 · 98 → 253 · 99 → 254 · 100 → 255
-    //
-    // The quadratic below the split still provides the gentle low-end slope
-    // (1% → alpha ~4) and a smooth visual ramp through the mid-range.
+    // Pieceswise: quadratic 0-60% for smooth low-end, linear 60-100% for step resolution.
     const SPLIT: f32 = 0.60;
-    // alpha at the split point under the quadratic (continuity anchor):
-    //   255 × (1 − (1−0.60)²) = 255 × 0.84 ≈ 214.2
     const ALPHA_AT_SPLIT: f32 = 255.0 * (1.0 - (1.0 - SPLIT) * (1.0 - SPLIT));
 
     let t = (level as f32 / 100.0).clamp(0.0, 1.0);

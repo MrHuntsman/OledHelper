@@ -72,6 +72,20 @@ pub fn startup_registry_exists() -> bool {
     rc == 0
 }
 
+/// Returns `true` when the process was launched with `--minimized`
+/// (i.e. by the Windows startup registry entry written by `toggle_startup`).
+///
+/// When this returns `true` the caller **must** call
+/// `hdr_panel.schedule_hdr_recheck()` after `init_d3d`.  Windows' display
+/// subsystem is not yet fully initialised at startup, so `is_any_monitor_hdr()`
+/// inside `init_d3d` would return `false` even on an HDR monitor, leaving the
+/// panel rendering in gray SDR mode until the app is restarted.  The deferred
+/// recheck runs on the first `render_tick` after the window becomes visible,
+/// by which time the HDR state is reliable.
+pub fn launched_minimized() -> bool {
+    std::env::args().any(|a| a == "--minimized")
+}
+
 /// Add or remove the HKCU Run entry based on `enabled`.
 /// Returns a status string suitable for display in the UI.
 pub unsafe fn toggle_startup(enabled: bool) -> &'static str {

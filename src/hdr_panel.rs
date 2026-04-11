@@ -145,6 +145,18 @@ pub struct HdrPanel {
     /// Set when `square_count` changes; causes `rebuild_digit_texture` to be
     /// called once at the start of the next `render_tick`, not on every drag tick.
     digit_texture_dirty:   bool,
+    /// Remaining number of ticks to retry HDR status checks.  DXGI often
+    /// reports stale color space data for a few hundred milliseconds after
+    /// a toggle while the driver settles; this counter creates a polling
+    /// window to ensure we catch the transition.
+    hdr_recheck_count:     u32,
+    /// Set after every `init_d3d` and cleared after the first successful
+    /// `Present`.  The DWM compositor doesn't connect a FLIP swap chain's
+    /// surface to the visual tree until after the HWND has been re-shown
+    /// at the OS level; calling `InvalidateRect` on the panel HWND after
+    /// the first present forces DWM to re-composite and eliminates the
+    /// solid-grey flash that would otherwise persist until the next resize.
+    needs_compositor_poke: bool,
     d3d:              Option<D3DResources>,
     width:            u32,
     height:           u32,
@@ -167,6 +179,8 @@ impl HdrPanel {
             sq_values_hdr, sq_values_sdr, sq_values: sq_values_sdr,
             render_dirty: true,
             digit_texture_dirty: false,
+            hdr_recheck_count: 0,
+            needs_compositor_poke: false,
             d3d: None, width: 0, height: 0,
         }
     }
@@ -267,6 +281,10 @@ impl HdrPanel {
         let swap3: IDXGISwapChain3 = sc1.cast()?;
         let _ = swap3.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
         self.hdr_active = is_any_monitor_hdr();
+        // For startup-minimized launches the caller calls schedule_hdr_recheck()
+        // immediately after init_d3d(), which resets hdr_active to false and sets
+        // hdr_recheck_pending so render_tick re-queries on the first visible tick,
+        // by which time the display subsystem is fully initialised.
 
         let mut res = D3DResources {
             device, ctx, swap3, rtv: None,
@@ -278,10 +296,25 @@ impl HdrPanel {
         self.recompute_square_values();
         self.rebuild_digit_texture();
         self.render_dirty = true;
+        // Signal that we need to poke the compositor after the first present.
+        // See the field comment on `needs_compositor_poke` for why this is needed.
+        self.needs_compositor_poke = true;
         Ok(())
     }
 
     // ── Public update / resize ────────────────────────────────────────────────
+
+    /// Schedules a sequence of HDR status re-checks over the next several
+    /// render ticks.  Required because DXGI often reports stale colour space
+    /// data for a few hundred milliseconds after an HDR toggle or resolution
+    /// switch while the driver finishes reconfiguring the pipeline.
+    pub fn schedule_hdr_recheck(&mut self) {
+        // Setting a retry count causes render_tick() to re-query
+        // is_any_monitor_hdr() over the next several ticks (10 ticks at 100ms
+        // = 1 second window) to ensure the UI eventually reflects the true
+        // hardware state once the driver has settled.
+        self.hdr_recheck_count = 10;
+    }
 
     pub unsafe fn update(&mut self, black_lift: i32) {
         let _ = black_lift; // lift is applied via SetDeviceGammaRamp; panel uses raw values
@@ -329,12 +362,21 @@ impl HdrPanel {
         changed
     }
 
-    pub unsafe fn render_tick(&mut self) {
+    /// Executes periodic maintenance and rendering. Returns `true` if the HDR
+    /// status changed during this tick.
+    pub unsafe fn render_tick(&mut self) -> bool {
+        let mut hdr_changed = false;
         // Proactively detect device loss even when not dirty, so a driver
         // restart while the panel is hidden still gets caught on the next tick.
         if self.is_device_lost() {
             self.recover_device();
-            return;
+            return false;
+        }
+        // Periodically re-check HDR status if a re-check window is active.
+        if self.hdr_recheck_count > 0 {
+            self.hdr_recheck_count -= 1;
+            hdr_changed = self.refresh_hdr_status();
+            if hdr_changed { self.hdr_recheck_count = 0; }
         }
         // Rebuild the digit texture lazily — only once the slider has settled
         // (i.e. on the first render_tick after set_square_count was called),
@@ -348,6 +390,7 @@ impl HdrPanel {
             let lost = self.render();
             if lost { self.recover_device(); }
         }
+        hdr_changed
     }
 
     /// Returns true if the D3D device has been removed (driver restart / GPU reset).
@@ -513,7 +556,6 @@ impl HdrPanel {
     unsafe fn render(&mut self) -> bool {
         let res = match &mut self.d3d { Some(r) => r, None => return false };
         let rtv = match &res.rtv { Some(r) => r.clone(), None => return false };
-
         let count = self.square_count;
         let vals  = &self.sq_values;
         let v     = |i: usize| if i < count { vals[i] } else { 0.0 };
@@ -582,6 +624,27 @@ impl HdrPanel {
                 return true; // signal device loss to caller
             }
         }
+
+        // After the first present following an init_d3d, the DWM compositor
+        // may not yet have connected the swap chain surface to the visual tree
+        // (this happens when the HWND was hidden/suspended via tray minimize).
+        // Calling InvalidateRect forces DWM to re-composite the child window,
+        // eliminating the solid-grey flash that would persist until the next
+        // WM_SIZE or user interaction.
+        // in render(), around line 634:
+        if self.needs_compositor_poke {
+            self.needs_compositor_poke = false;
+            // Queue a second frame so DWM receives a fresh present *after* the
+            // InvalidateRect poke.  On normal first-show WM_SIZE arrives and
+            // provides this naturally; on tray-restore after a startup-minimized
+            // launch there is no WM_SIZE (size unchanged), so without this line
+            // render_dirty stays false and the grey placeholder DWM shows while
+            // the new swap-chain surface settles is never overwritten.
+            self.render_dirty = true;
+            use windows::Win32::Graphics::Gdi::InvalidateRect;
+            InvalidateRect(self.hwnd, None, false);
+        }
+
         false
     }
 }

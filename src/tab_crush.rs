@@ -1,15 +1,4 @@
-// tab_crush.rs — Black Crush Tweak tab.
-//
-// Owns all state fields, control handles, and business logic that belong
-// exclusively to the Black Crush Tweak tab (tab 0):
-//   · black gamma ramp (SetDeviceGammaRamp / Reinhard curve)
-//   · Per-Hz profile auto-apply
-//   · Refresh rate dropdown
-//   · Compare (preview) toggle button
-//   · NVIDIA CAM detection
-//
-// Rendering helpers (subclass procs, paint routines) remain in ui_drawing.rs.
-// Compile-time constants remain in constants.rs.
+// tab_crush.rs — Black Crush logic, profiles, and UI state.
 
 #![allow(non_snake_case, unused_variables, unused_mut, unused_assignments,
          unused_must_use)]
@@ -107,14 +96,14 @@ impl CrushTab {
 
         let h_lbl_title      = cb.static_text(w!("Black Crush Tweak"), 0);
         let h_lbl_sub1       = cb.static_text(
-            w!("Tweak black values with SetDeviceGammaRamp (Reinhard shadow curve)."), 0);
-        let h_lbl_sub2       = cb.static_text(w!("Pure black is not raised."), 0);
+            w!("Adjust black levels using a Reinhard gamma curve. Preserves pure black."), 0);
+        let h_lbl_sub2       = cb.static_text(w!("You can use a different value for each refresh rate."), 0);
         let h_lbl_bl_sect    = cb.static_text(w!("Black Level"), SS_NOPREFIX);
         let h_sld_black      = cb.slider(IDC_SLD_BLACK, 0, MAX_BLACK, DEFAULT_BLACK);
         let h_lbl_black_val  = cb.static_text(w!("OFF"), SS_CENTERIMAGE);
         let h_lbl_sl_hint    = cb.static_text(w!(""), 0);
         let h_lbl_gamma_warn = cb.static_text(w!(""), 0);
-        let h_lbl_hdr_sect   = cb.static_text(w!("Near-Black Calibration"), SS_NOPREFIX);
+        let h_lbl_hdr_sect   = cb.static_text(w!("HDR-Black Calibration"), SS_NOPREFIX);
         let h_sld_squares    = cb.slider(IDC_SLD_SQUARES, 9, 24, 9);
         let h_lbl_range_val  = cb.static_text(w!(""), SS_CENTERIMAGE);
         let h_lbl_hdr_note   = cb.static_text(
@@ -136,7 +125,7 @@ impl CrushTab {
         }
 
         let h_lbl_ref_sect = cb.static_text(w!("Refresh Rate"), SS_NOPREFIX);
-        let h_lbl_hz_profile = cb.static_text(w!("(Each refresh has a different black level profile.)"), SS_NOPREFIX);
+        let h_lbl_hz_profile = cb.static_text(w!(""), SS_NOPREFIX);
         let h_lbl_hz_icon  = cb.static_text(w!(""), SS_NOPREFIX);
         let h_ddl_refresh  = cb.combobox(IDC_DDL_REFRESH);
         {
@@ -197,13 +186,20 @@ impl CrushTab {
     // ── HDR labels ────────────────────────────────────────────────────────────
 
     pub unsafe fn update_range_label(&self) {
-        // The squares slider no longer shows a text value label — the zoom icons
-        // on either side convey direction. Keep this as a no-op so callers compile.
+        // No-op: label removed in favor of icons.
         let _ = get_slider_val(self.h_sld_squares);
+    }
+
+    pub unsafe fn update_hdr_sect_label(&self) {
+        let hdr = self.hdr_panel.hdr_active;
+        set_window_text(self.h_lbl_hdr_sect,
+            if hdr { "HDR Black Calibration (PQ)" }
+            else   { "SDR Black Calibration (RGB)" });
     }
 
     pub unsafe fn update_sl_hint(&self) {
         let hdr = self.hdr_panel.hdr_active;
+        self.update_hdr_sect_label();
         set_window_text(self.h_lbl_sl_hint,
             if hdr {
                 "Raise black level until you can almost barely start to see the PQ 68 column."
@@ -214,9 +210,7 @@ impl CrushTab {
 
     // ── Sliders ───────────────────────────────────────────────────────────────
 
-    /// Called on WM_HSCROLL for the black-level slider.
-    /// Called on every WM_HSCROLL tick during a drag.
-    /// Updates the label, HDR panel, and dropdown bracket — no INI write.
+    /// Real-time visual updates during black-level drag.
     pub unsafe fn on_black_slider_visual(&mut self) {
         let v = get_slider_val(self.h_sld_black);
         let text = if v == 0 { "OFF".to_string() } else { format!("{v}") };
@@ -226,8 +220,7 @@ impl CrushTab {
         self.refresh_dropdown_label(hz as u32, v);
     }
 
-    /// Called once on TB_ENDTRACK or on programmatic changes.
-    /// Applies the gamma ramp, persists to INI, and refreshes the dropdown label.
+    /// Commits black-level changes to ramp and INI.
     pub unsafe fn on_black_slider_changed(&mut self, ini: &mut ProfileManager) {
         let v = get_slider_val(self.h_sld_black);
         let text = if v == 0 { "OFF".to_string() } else { format!("{v}") };
@@ -239,9 +232,7 @@ impl CrushTab {
         self.refresh_dropdown_label(hz as u32, v);
     }
 
-    /// Update the combobox item text for `hz` to reflect the current black level `v`.
-    /// Items with v == 0 show plain "N Hz"; items with v > 0 show "N Hz [v]".
-    /// Only the matching item is touched — all others are left unchanged.
+    /// Updates Hz bracket label in dropdown without flicker.
     pub unsafe fn refresh_dropdown_label(&self, hz: u32, v: i32) {
         let count = SendMessageW(self.h_ddl_refresh, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as i32;
         for i in 0..count {
@@ -256,9 +247,6 @@ impl CrushTab {
                 .parse().unwrap_or(0);
             if item_hz != hz { continue; }
 
-            // Replace the item in-place: delete + insert at the same index.
-            // SetRedraw(FALSE) prevents the intermediate state (item deleted but
-            // not yet re-inserted) from reaching the screen, killing the blue flash.
             let cur_sel = SendMessageW(self.h_ddl_refresh, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
             let new_label = if v > 0 {
                 format!("{hz} Hz [{v}]\0")
@@ -272,7 +260,6 @@ impl CrushTab {
                 WPARAM(i as usize), LPARAM(new_w.as_ptr() as isize));
             SendMessageW(self.h_ddl_refresh, CB_SETCURSEL, WPARAM(cur_sel as usize), LPARAM(0));
             SendMessageW(self.h_ddl_refresh, WM_SETREDRAW, WPARAM(1), LPARAM(0));
-            // Repaint so the collapsed selected-item area shows the updated text.
             InvalidateRect(self.h_ddl_refresh, None, false);
             break;
         }
@@ -286,8 +273,7 @@ impl CrushTab {
 
     // ── Gamma ramp ────────────────────────────────────────────────────────────
 
-    /// Apply the Reinhard shadow curve ramp from the current slider value.
-    /// Returns `(ok, v)` so the caller can update the status bar.
+    /// Applies current black-level ramp.
     pub unsafe fn apply_ramp(&self) -> (bool, i32) {
         let v    = get_slider_val(self.h_sld_black);
         let ramp = gamma_ramp::build_ramp(v);
@@ -301,7 +287,7 @@ impl CrushTab {
         (ok != 0, v)
     }
 
-    /// Apply a flat linear ramp (no correction) — used during Compare preview.
+    /// Applies neutral ramp for comparison.
     pub unsafe fn apply_linear_ramp(&self) -> bool {
         let null = HWND(std::ptr::null_mut());
         let ramp = gamma_ramp::build_linear_ramp();
@@ -354,12 +340,8 @@ impl CrushTab {
 
     // ── NVIDIA CAM detection ──────────────────────────────────────────────────
 
+    /// Check for NVIDIA "Color Accuracy Mode" via registry.
     pub unsafe fn is_nvidia_cam_enabled() -> bool {
-        // All string constants as UTF-16 arrays — zero heap allocation.
-        // The registry path and value name are fixed; the sub-key is assembled
-        // by copying the enum result directly into a stack buffer and appending
-        // the "\\Color\0" suffix in UTF-16, avoiding the round-trip through UTF-8.
-
         const PATH_W: &[u16] = &[
             b'S' as u16, b'O' as u16, b'F' as u16, b'T' as u16, b'W' as u16,
             b'A' as u16, b'R' as u16, b'E' as u16, b'\\' as u16, b'N' as u16,
@@ -374,13 +356,11 @@ impl CrushTab {
             0u16, // NUL terminator
         ];
 
-        // Suffix appended to each enumerated sub-key name to form the Color path.
         const COLOR_SUFFIX: &[u16] = &[
             b'\\' as u16, b'C' as u16, b'o' as u16, b'l' as u16,
             b'o' as u16,  b'r' as u16, 0u16, // NUL terminator
         ];
 
-        // Value name queried inside the Color sub-key.
         const VNAME: &[u16] = &[
             b'3' as u16, b'5' as u16, b'3' as u16, b'8' as u16,
             b'9' as u16, b'7' as u16, b'0' as u16, 0u16, // NUL terminator
@@ -397,12 +377,9 @@ impl CrushTab {
             if RegEnumKeyExW(key, idx, PWSTR(name_buf.as_mut_ptr()), &mut name_len,
                 None, PWSTR::null(), None, None) != ERROR_SUCCESS { break; }
 
-            // Build "<EnumName>\\Color\0" entirely in a stack buffer.
-            // name_len is the character count excluding NUL (guaranteed by the API).
             let name_len = name_len as usize;
-            let suffix_len = COLOR_SUFFIX.len(); // includes NUL
+            let suffix_len = COLOR_SUFFIX.len();
             let sub_total = name_len + suffix_len;
-            // name_buf is 256 u16s; sub_buf needs room for name + suffix (max ~263).
             let mut sub_buf = [0u16; 512];
             sub_buf[..name_len].copy_from_slice(&name_buf[..name_len]);
             sub_buf[name_len..sub_total].copy_from_slice(COLOR_SUFFIX);

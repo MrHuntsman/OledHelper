@@ -23,6 +23,7 @@ use windows::Win32::{
 
 const BYTES_CRUSH:   &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_crush.png"));
 const BYTES_DIMMER:  &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_dimmer.png"));
+const BYTES_SYSTEM:  &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_system.png"));
 const BYTES_HOTKEYS: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_hotkeys.png"));
 const BYTES_DEBUG:   &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_debug.png"));
 const BYTES_ABOUT:   &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/tab_about.png"));
@@ -34,6 +35,7 @@ const BYTES_ZOOM_OUT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
 pub struct NavIcons {
     pub crush:   Option<HBITMAP>,
     pub dimmer:  Option<HBITMAP>,
+    pub system:  Option<HBITMAP>,
     pub hotkeys: Option<HBITMAP>,
     pub debug:   Option<HBITMAP>,
     pub about:   Option<HBITMAP>,
@@ -52,6 +54,7 @@ impl NavIcons {
         Self {
             crush:    decode_png(BYTES_CRUSH,    icon_px),
             dimmer:   decode_png(BYTES_DIMMER,   icon_px),
+            system:   decode_png(BYTES_SYSTEM,   icon_px),
             hotkeys:  decode_png(BYTES_HOTKEYS,  icon_px),
             debug:    decode_png(BYTES_DEBUG,    icon_px),
             about:    decode_png(BYTES_ABOUT,    icon_px),
@@ -62,7 +65,7 @@ impl NavIcons {
 
     /// Delete all GDI bitmaps. Call on WM_DESTROY.
     pub unsafe fn destroy(&self) {
-        for bmp in [self.crush, self.dimmer, self.hotkeys, self.debug, self.about, self.zoom, self.zoom_out]
+        for bmp in [self.crush, self.dimmer, self.system, self.hotkeys, self.debug, self.about, self.zoom, self.zoom_out]
             .iter().flatten()
         {
             let _ = DeleteObject(*bmp);
@@ -75,6 +78,7 @@ impl NavIcons {
 pub struct TabHeaderIcons {
     pub crush:   Option<HBITMAP>,
     pub dimmer:  Option<HBITMAP>,
+    pub system:  Option<HBITMAP>,
     pub hotkeys: Option<HBITMAP>,
     pub debug:   Option<HBITMAP>,
     pub about:   Option<HBITMAP>,
@@ -86,6 +90,7 @@ impl TabHeaderIcons {
         Self {
             crush:   decode_png(BYTES_CRUSH,   icon_px),
             dimmer:  decode_png(BYTES_DIMMER,  icon_px),
+            system:  decode_png(BYTES_SYSTEM,  icon_px),
             hotkeys: decode_png(BYTES_HOTKEYS, icon_px),
             debug:   decode_png(BYTES_DEBUG,   icon_px),
             about:   decode_png(BYTES_ABOUT,   icon_px),
@@ -93,7 +98,7 @@ impl TabHeaderIcons {
     }
 
     pub unsafe fn destroy(&self) {
-        for bmp in [self.crush, self.dimmer, self.hotkeys, self.debug, self.about]
+        for bmp in [self.crush, self.dimmer, self.system, self.hotkeys, self.debug, self.about]
             .iter().flatten()
         {
             let _ = DeleteObject(*bmp);

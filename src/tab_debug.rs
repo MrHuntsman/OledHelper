@@ -1,26 +1,5 @@
-// tab_debug.rs — Debug tab (tab 3).
-//
-// Shows live readouts of the Taskbar Dimmer's internal state so that
-// detection logic (fullscreen, auto-hide, menu) can be verified without
-// attaching a debugger.  The tab is purely informational — no persistent
-// state, no INI writes.
-//
-// Style follows the conventions established in tab_crush.rs / tab_hotkeys.rs:
-//   • 16pt bold Segoe UI  — tab title  (font_title)
-//   • 11pt bold Segoe UI  — section headings  (font_sect, leaked like the other tabs)
-//   • 10pt Segoe UI        — body labels / values  (font_normal, default)
-//   • SS_BLACKRECT separators under every section heading
-//   • SS_NOPREFIX on every static label that might contain '&'
-//
-// New additions:
-//   • "Overlay Z-Order Position" row in "Dimmer State" — walks desktop Z-order
-//     via GetWindow and reports the 1-based position of each overlay window.
-//   • "Mouse Click Log" section — installs a WH_MOUSE_LL hook while the debug
-//     tab is visible.  Every LMB / RMB / MMB click is logged with its timestamp,
-//     button, screen coordinates, target HWND, window class name, and title.
-//   • install_mouse_hook() / uninstall_mouse_hook() — called from show_tab when
-//     switching into / out of the debug tab so the hook is never active in
-//     production (non-debug) builds and is cleaned up on tab switch / exit.
+// tab_debug.rs — Live internal state and event logging.
+// Purely informational — no persistent state or INI writes.
 
 #![allow(non_snake_case, unused_variables, unused_mut, unused_must_use)]
 
@@ -41,7 +20,7 @@ use crate::{
     constants::*,
     controls::ControlBuilder,
     tab_dimmer::{DimmerTab, zorder_log},
-    ui_drawing::make_font,
+    ui_drawing::{make_font, hdr_toggle_subclass_proc, SetWindowSubclass},
     win32::{set_text_fmt, ControlGroup},
 };
 
@@ -74,8 +53,7 @@ pub unsafe fn install_mouse_hook(main_hwnd: HWND) {
     MOUSE_HOOK.store(hook.0 as isize, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Remove the WH_MOUSE_LL hook.
-/// Idempotent — safe to call when the hook is not installed.
+/// Remove mouse hook. Idempotent.
 pub unsafe fn uninstall_mouse_hook() {
     let raw = MOUSE_HOOK.swap(0, std::sync::atomic::Ordering::Relaxed);
     if raw != 0 {
@@ -83,13 +61,9 @@ pub unsafe fn uninstall_mouse_hook() {
     }
 }
 
-/// Register the debug-mode hotkeys (currently: '1' = force-raise overlays).
-/// Call when switching into the debug tab.  Idempotent.
-/// No-op when not running in debug mode — call sites don't need to check.
+/// Registers debug hotkeys ('1' = force-raise). Idempotent.
 pub unsafe fn install_debug_hotkeys(hwnd: HWND) {
     if !crate::app::is_debug_mode() { return; }
-    // No modifier — bare '1' key.  MOD_NOREPEAT (0x4000) suppresses auto-repeat
-    // so holding the key doesn't flood the message queue.
     let _ = RegisterHotKey(
         hwnd,
         crate::constants::HK_DEBUG_FORCE_RAISE,
@@ -98,16 +72,12 @@ pub unsafe fn install_debug_hotkeys(hwnd: HWND) {
     );
 }
 
-/// Unregister the debug-mode hotkeys.
-/// Call when switching away from the debug tab or on shutdown.  Idempotent.
+/// Unregister debug hotkeys. Idempotent.
 pub unsafe fn uninstall_debug_hotkeys(hwnd: HWND) {
     let _ = UnregisterHotKey(hwnd, crate::constants::HK_DEBUG_FORCE_RAISE);
 }
 
-/// Low-level mouse hook proc — runs on the UI thread's message pump.
-/// On every button-down event we pack the screen coordinates into lparam
-/// and post `WM_MOUSE_CLICK_LOG` to the main window for processing on the
-/// UI thread (where we can safely call Win32 UI APIs like WindowFromPoint).
+/// Hook proc: packs coordinates and posts message to UI thread.
 unsafe extern "system" fn ll_mouse_proc(
     code: i32,
     wparam: WPARAM,
@@ -128,7 +98,6 @@ unsafe extern "system" fn ll_mouse_proc(
             let main_raw = crate::tab_dimmer::MAIN_HWND_FOR_HOOK
                 .load(std::sync::atomic::Ordering::Relaxed);
             if main_raw != 0 {
-                // Pack x into the high 32 bits and y into the low 32 bits.
                 let packed: isize =
                     ((ms.pt.x as u32 as i64) << 32 | (ms.pt.y as u32 as i64)) as isize;
                 let _ = PostMessageW(
@@ -254,6 +223,10 @@ impl DebugTab {
             IDC_CHK_SUPPRESS_AH.into());
         for h in [h_chk_suppress_fs, h_chk_suppress_ah] {
             SendMessageW(h, BM_SETCHECK, WPARAM(1), LPARAM(0)); // checked = enabled by default
+            // Install hover-tracking subclass so TOGGLE_HOVER_PROP is set on
+            // mouse enter/leave — draw_dark_button_full's checkbox branch reads it.
+            // ref_data = 1 → left-aligned pill hit-test (same as dimmer toggle).
+            SetWindowSubclass(h, Some(hdr_toggle_subclass_proc), 4, 1);
         }
 
         // ── "Event Log" section (Z-order events + mouse clicks, unified) ────────

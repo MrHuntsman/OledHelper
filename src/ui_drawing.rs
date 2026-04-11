@@ -1,6 +1,4 @@
-// ui_drawing.rs — custom WndProc subclasses (slider, button, combo, overlay),
-//                owner-draw painting for buttons / tabs / checkboxes, and
-//                modal input / hotkey dialogs.
+// ui_drawing.rs — GDI/GDI+ custom painting and subclassing.
 
 #![allow(non_snake_case, clippy::too_many_lines, unused_variables,
          unused_mut, unused_assignments, unused_must_use)]
@@ -24,39 +22,15 @@ use windows::{
     },
 };
 
-// SetWindowSubclass / RemoveWindowSubclass / DefSubclassProc live in comctl32
-// and are not re-exported by windows-rs 0.58's Controls bindings.
+type SubclassProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
+
 #[link(name = "comctl32")]
 extern "system" {
-    pub fn SetWindowSubclass(
-        hwnd:        windows::Win32::Foundation::HWND,
-        pfn_subclass: Option<unsafe extern "system" fn(
-            windows::Win32::Foundation::HWND, u32,
-            windows::Win32::Foundation::WPARAM,
-            windows::Win32::Foundation::LPARAM,
-            usize, usize,
-        ) -> windows::Win32::Foundation::LRESULT>,
-        uid_subclass: usize,
-        dw_ref_data:  usize,
-    ) -> windows::Win32::Foundation::BOOL;
-
-    pub fn RemoveWindowSubclass(
-        hwnd:        windows::Win32::Foundation::HWND,
-        pfn_subclass: Option<unsafe extern "system" fn(
-            windows::Win32::Foundation::HWND, u32,
-            windows::Win32::Foundation::WPARAM,
-            windows::Win32::Foundation::LPARAM,
-            usize, usize,
-        ) -> windows::Win32::Foundation::LRESULT>,
-        uid_subclass: usize,
-    ) -> windows::Win32::Foundation::BOOL;
-
-    pub fn DefSubclassProc(
-        hwnd:   windows::Win32::Foundation::HWND,
-        msg:    u32,
-        wparam: windows::Win32::Foundation::WPARAM,
-        lparam: windows::Win32::Foundation::LPARAM,
-    ) -> windows::Win32::Foundation::LRESULT;
+    pub fn SetWindowSubclass(hwnd: HWND, pfn_subclass: Option<SubclassProc>,
+                             uid_subclass: usize, dw_ref_data: usize) -> BOOL;
+    pub fn RemoveWindowSubclass(hwnd: HWND, pfn_subclass: Option<SubclassProc>,
+                                uid_subclass: usize) -> BOOL;
+    pub fn DefSubclassProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
 }
 
 // AlphaBlend lives in Msimg32 — link it explicitly.
@@ -116,6 +90,15 @@ pub unsafe fn gdip_init() {
     });
 }
 
+/// Lighten a COLORREF (0x00BBGGRR) by adding `amount` to each channel (clamped).
+#[inline]
+fn lighten_colorref(cr: COLORREF, amount: u32) -> COLORREF {
+    let r = ((cr.0        & 0xFF) + amount).min(0xFF);
+    let g = (((cr.0 >> 8) & 0xFF) + amount).min(0xFF);
+    let b = (((cr.0 >>16) & 0xFF) + amount).min(0xFF);
+    COLORREF(r | (g << 8) | (b << 16))
+}
+
 /// COLORREF (0x00BBGGRR) → GDI+ ARGB (0xAARRGGBB).
 #[inline]
 pub fn colorref_to_argb(cr: COLORREF, a: u8) -> u32 {
@@ -125,72 +108,46 @@ pub fn colorref_to_argb(cr: COLORREF, a: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// Fill a rounded rectangle using GDI+ (antialiased).
-/// `radius` is the ellipse diameter used for each corner (same as GDI's RoundRect).
-pub unsafe fn fill_round_rect(
-    graphics: *mut GpGraphics,
-    color:    COLORREF,
-    alpha:    u8,
-    x: i32, y: i32, w: i32, h: i32,
-    radius: i32,
-) {
-    if w <= 0 || h <= 0 { return; }
-    let argb = colorref_to_argb(color, alpha);
-    let mut brush: *mut GpSolidFill = ptr::null_mut();
-    GdipCreateSolidFill(argb, &mut brush);
-
-    // Build a rounded-rect path from four arcs.
+/// Build a rounded-rectangle GDI+ path. Caller must call GdipDeletePath.
+unsafe fn build_round_rect_path(x: i32, y: i32, w: i32, h: i32, radius: i32) -> *mut GpPath {
     let mut path: *mut GpPath = ptr::null_mut();
     GdipCreatePath(FillModeAlternate, &mut path);
-    let d = radius.min(w / 2).min(h / 2).max(1) * 2; // corner ellipse diameter
-    let d_f  = d  as f32;
-    let x_f  = x  as f32;
-    let y_f  = y  as f32;
-    let w_f  = w  as f32;
-    let h_f  = h  as f32;
-    // top-left, top-right, bottom-right, bottom-left arcs
+    let d   = radius.min(w / 2).min(h / 2).max(1) * 2;
+    let d_f = d as f32;
+    let x_f = x as f32; let y_f = y as f32;
+    let w_f = w as f32; let h_f = h as f32;
     GdipAddPathArc(path, x_f,             y_f,             d_f, d_f, 180.0, 90.0);
     GdipAddPathArc(path, x_f + w_f - d_f, y_f,             d_f, d_f, 270.0, 90.0);
     GdipAddPathArc(path, x_f + w_f - d_f, y_f + h_f - d_f, d_f, d_f,   0.0, 90.0);
     GdipAddPathArc(path, x_f,             y_f + h_f - d_f, d_f, d_f,  90.0, 90.0);
     GdipClosePathFigure(path);
-    GdipFillPath(graphics, brush as _, path);
+    path
+}
 
+/// Fill a rounded rectangle using GDI+ (antialiased).
+pub unsafe fn fill_round_rect(
+    graphics: *mut GpGraphics, color: COLORREF, alpha: u8,
+    x: i32, y: i32, w: i32, h: i32, radius: i32,
+) {
+    if w <= 0 || h <= 0 { return; }
+    let mut brush: *mut GpSolidFill = ptr::null_mut();
+    GdipCreateSolidFill(colorref_to_argb(color, alpha), &mut brush);
+    let path = build_round_rect_path(x, y, w, h, radius);
+    GdipFillPath(graphics, brush as _, path);
     GdipDeletePath(path);
     GdipDeleteBrush(brush as _);
 }
 
-/// Stroke a rounded rectangle border using GDI+ (antialiased).
 pub unsafe fn draw_round_rect(
-    graphics:   *mut GpGraphics,
-    color:      COLORREF,
-    alpha:      u8,
-    pen_width:  f32,
-    x: i32, y: i32, w: i32, h: i32,
-    radius: i32,
+    graphics: *mut GpGraphics, color: COLORREF, alpha: u8, pen_width: f32,
+    x: i32, y: i32, w: i32, h: i32, radius: i32,
 ) {
     if w <= 0 || h <= 0 { return; }
-    let argb = colorref_to_argb(color, alpha);
     let mut pen: *mut GpPen = ptr::null_mut();
-    GdipCreatePen1(argb, pen_width, UnitPixel, &mut pen);
-
-    let mut path: *mut GpPath = ptr::null_mut();
-    GdipCreatePath(FillModeAlternate, &mut path);
-    let d = radius.min(w / 2).min(h / 2).max(1) * 2;
-    let d_f = d  as f32;
-    // Inset by half pen width so the stroke falls inside the rect bounds.
-    let half = pen_width / 2.0;
-    let x_f  = x as f32 + half;
-    let y_f  = y as f32 + half;
-    let w_f  = w as f32 - pen_width;
-    let h_f  = h as f32 - pen_width;
-    GdipAddPathArc(path, x_f,             y_f,             d_f, d_f, 180.0, 90.0);
-    GdipAddPathArc(path, x_f + w_f - d_f, y_f,             d_f, d_f, 270.0, 90.0);
-    GdipAddPathArc(path, x_f + w_f - d_f, y_f + h_f - d_f, d_f, d_f,   0.0, 90.0);
-    GdipAddPathArc(path, x_f,             y_f + h_f - d_f, d_f, d_f,  90.0, 90.0);
-    GdipClosePathFigure(path);
+    GdipCreatePen1(colorref_to_argb(color, alpha), pen_width, UnitPixel, &mut pen);
+    let half = (pen_width / 2.0).round() as i32;
+    let path = build_round_rect_path(x + half, y + half, w - half * 2, h - half * 2, radius);
     GdipDrawPath(graphics, pen, path);
-
     GdipDeletePath(path);
     GdipDeletePen(pen);
 }
@@ -210,23 +167,11 @@ struct FontCacheKey {
     bold: bool,
 }
 
-unsafe fn pcwstr_to_string(face: PCWSTR) -> String {
-    if face.0.is_null() {
-        return String::new();
-    }
-    let mut len = 0;
-    while *face.0.add(len) != 0 {
-        len += 1;
-    }
-    let slice = std::slice::from_raw_parts(face.0, len);
-    String::from_utf16_lossy(slice)
-}
-
 pub unsafe fn make_font_cached(face: PCWSTR, pt: i32, dpi: u32, bold: bool) -> HFONT {
     static FONT_CACHE: OnceLock<Mutex<HashMap<FontCacheKey, usize>>> = OnceLock::new();
     let cache = FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = FontCacheKey {
-        family: pcwstr_to_string(face),
+        family: face.to_string().unwrap_or_default(),
         pt,
         dpi,
         bold,
@@ -266,14 +211,29 @@ pub unsafe fn combo_selected_text(hwnd: HWND) -> Option<String> {
 
 
 pub unsafe fn set_window_text(hwnd: HWND, text: &str) {
-    let w: Vec<u16> = (text.to_owned() + "\0").encode_utf16().collect();
-    SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    crate::win32::set_text(hwnd, text);
 }
 
 pub unsafe fn client_size_of(hwnd: HWND) -> (i32, i32) {
     let mut rc = RECT::default();
     GetClientRect(hwnd, &mut rc);
     (rc.right, rc.bottom)
+}
+
+// ── Shared mouse-tracking helper ──────────────────────────────────────────────
+//
+unsafe fn begin_mouse_track(hwnd: HWND, prop: PCWSTR) -> bool {
+    if !GetPropW(hwnd, prop).0.is_null() { return false; }
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize:      mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags:     TME_LEAVE,
+        hwndTrack:   hwnd,
+        dwHoverTime: 0,
+    };
+    TrackMouseEvent(&mut tme);
+    SetPropW(hwnd, prop, HANDLE(1 as *mut _));
+    InvalidateRect(hwnd, None, false);
+    true
 }
 
 // ── Custom slider WndProc ────────────────────────────────────────────────────
@@ -283,25 +243,17 @@ pub unsafe fn client_size_of(hwnd: HWND) -> (i32, i32) {
 // and fires WM_HSCROLL — we only replace the visual output.
 
 const SLIDER_ORIG_PROC_PROP:  PCWSTR = w!("BCT_SliderOrigProc");
-const SLIDER_HOVER_PROP:      PCWSTR = w!("BCT_SliderHover");      // cursor over thumb
-const SLIDER_TRACK_HOVER_PROP: PCWSTR = w!("BCT_SliderTrackHover"); // cursor anywhere on slider
+const SLIDER_HOVER_PROP:      PCWSTR = w!("BCT_SliderHover");
+const SLIDER_TRACK_HOVER_PROP: PCWSTR = w!("BCT_SliderTrackHover");
 const SLIDER_DRAG_PROP:       PCWSTR = w!("BCT_SliderDrag");
-const SLIDER_FILL_PROP:       PCWSTR = w!("BCT_SliderFill"); // current fill diameter * 16 (fixed-point)
-// Delta-time animation bookkeeping — stored as Win32 window properties.
-const SLIDER_ANIM_START_PROP:    PCWSTR = w!("BCT_SliderAnimStart");    // timeGetTime() at transition start (ms)
-const SLIDER_ANIM_STARTVAL_PROP: PCWSTR = w!("BCT_SliderAnimStartVal"); // fill * 16 at transition start
+const SLIDER_FILL_PROP:       PCWSTR = w!("BCT_SliderFill");
+const SLIDER_ANIM_START_PROP:    PCWSTR = w!("BCT_SliderAnimStart");
+const SLIDER_ANIM_STARTVAL_PROP: PCWSTR = w!("BCT_SliderAnimStartVal");
 
-const SLIDER_ANIM_TIMER: usize = 0xBC7A;  // arbitrary private timer ID
+const SLIDER_ANIM_TIMER: usize = 0xBC7A;
 
-// Duration of the fill-dot expand/contract animation in milliseconds.
-// Completely independent of the timer period — the same visual speed
-// on 30 Hz, 60 Hz, 144 Hz, or any VSync-off scenario.
 const ANIM_DURATION_MS: f32 = 120.0;
 
-/// Timer interval (ms) used for slider hover animations.
-/// Updated whenever the display refresh rate changes so the animation
-/// fires at roughly one tick per display frame.
-/// Default 8 ms (~120 Hz) until the first refresh-rate query overrides it.
 pub static SLIDER_ANIM_INTERVAL_MS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(8);
 
@@ -359,24 +311,10 @@ pub unsafe extern "system" fn slider_subclass_proc(
             let on_thumb = (mx - thumb_cx).abs() <= thumb_hl + (2 * dpi / 96).max(1);
 
             // Register WM_MOUSELEAVE once while cursor is anywhere inside the slider.
-            let tracking = !GetPropW(hwnd, w!("BCT_SliderTracking")).0.is_null();
-            if !tracking {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize:      mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags:     TME_LEAVE,
-                    hwndTrack:   hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut tme);
-                SetPropW(hwnd, w!("BCT_SliderTracking"), HANDLE(1 as *mut _));
-            }
+            begin_mouse_track(hwnd, w!("BCT_SliderTracking"));
 
             // Track-level hover — set as soon as mouse is anywhere on the slider.
-            let was_track_hovering = !GetPropW(hwnd, SLIDER_TRACK_HOVER_PROP).0.is_null();
-            if !was_track_hovering {
-                SetPropW(hwnd, SLIDER_TRACK_HOVER_PROP, HANDLE(1 as *mut _));
-                InvalidateRect(hwnd, None, false);
-            }
+            begin_mouse_track(hwnd, SLIDER_TRACK_HOVER_PROP);
 
             // SLIDER_HOVER_PROP tracks thumb-specific hover — drives the animation.
             let was_on_thumb = !GetPropW(hwnd, SLIDER_HOVER_PROP).0.is_null();
@@ -478,11 +416,7 @@ pub unsafe extern "system" fn slider_subclass_proc(
             let cur_fp_raw = GetPropW(hwnd, SLIDER_FILL_PROP).0 as isize;
             let cur_fp = if cur_fp_raw == 0 { idle_dot * 16 } else { cur_fp_raw as i32 };
 
-            // ── Delta-time interpolation ──────────────────────────────────────
-            // We lerp from `start_fp` → `target_fp` over ANIM_DURATION_MS using
-            // an ease-out-cubic curve.  `t` is computed from wall-clock elapsed
-            // time so the animation runs at the same *visual* speed regardless of
-            // how frequently WM_TIMER fires (30 Hz, 60 Hz, 144 Hz, or any rate).
+            // Delta-time eased interpolation.
 
             let now_ms   = timeGetTime();
             let start_ms = GetPropW(hwnd, SLIDER_ANIM_START_PROP).0 as usize as u32;
@@ -506,7 +440,6 @@ pub unsafe extern "system" fn slider_subclass_proc(
             InvalidateRect(hwnd, None, false);
 
             if new_fp == target_fp {
-                // Animation complete — stop the timer and clear bookkeeping props.
                 KillTimer(hwnd, SLIDER_ANIM_TIMER);
                 RemovePropW(hwnd, SLIDER_ANIM_START_PROP);
                 RemovePropW(hwnd, SLIDER_ANIM_STARTVAL_PROP);
@@ -514,9 +447,6 @@ pub unsafe extern "system" fn slider_subclass_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            // WM_NCDESTROY is the correct place to call RemoveWindowSubclass.
-            // Using WM_DESTROY risks a use-after-free if comctl32 calls
-            // DefSubclassProc after we've already removed the subclass entry.
             RemovePropW(hwnd, SLIDER_ORIG_PROC_PROP);
             RemovePropW(hwnd, SLIDER_HOVER_PROP);
             RemovePropW(hwnd, SLIDER_TRACK_HOVER_PROP);
@@ -537,8 +467,7 @@ unsafe fn slider_thumb_d(dpi: i32) -> i32 {
     (THUMB_D * dpi / 96).max(1)
 }
 
-/// Compute the slider value from a mouse X coordinate and apply it,
-/// then notify the parent via WM_HSCROLL so the app reacts immediately.
+/// Set slider position based on client coordinate.
 pub unsafe fn slider_set_from_x(hwnd: HWND, mx: i32) {
     let mut rc = RECT::default();
     GetClientRect(hwnd, &mut rc);
@@ -570,10 +499,6 @@ pub unsafe fn slider_set_from_x(hwnd: HWND, mx: i32) {
 
     if let Ok(parent) = GetParent(hwnd) {
         if !parent.0.is_null() {
-            // PostMessageW instead of SendMessageW so the WM_HSCROLL handler
-            // (which may call SetDeviceGammaRamp or other slow work) runs after
-            // this WM_MOUSEMOVE returns.  This keeps mouse tracking responsive
-            // regardless of how expensive the app's slider handler is.
             let _ = PostMessageW(parent, WM_HSCROLL,
                 WPARAM((TB_THUMBTRACK as usize) | ((new_val as usize) << 16)),
                 LPARAM(hwnd.0 as isize));
@@ -587,9 +512,6 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
     let w = rc.right;
     let h = rc.bottom;
 
-    // ── All painting goes into a back-buffer; one BitBlt at the end. ──────────
-    // This eliminates tearing from both the GDI track layers and the GDI+
-    // thumb layers being visible mid-frame during animations.
     let mem_dc  = CreateCompatibleDC(hdc);
     let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
     let old_bmp = SelectObject(mem_dc, mem_bmp);
@@ -633,24 +555,7 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
 
     let r = track_h / 2;
 
-    // ── Track + thumb — single GDI+ pass, back-to-front ──────────────────────
-    //
-    // The fringe artifact is caused by drawing a track segment that ends at an
-    // integer pixel boundary and trying to mask off the GDI+ AA overshoot with
-    // a GDI rect — GDI and GDI+ share the same DC but GDI+ ignores the GDI
-    // clip region, so AA pixels always bleed through.
-    //
-    // Solution: never fight the AA. Instead paint in strict Z-order so each
-    // layer fully covers the seam of the one below it:
-    //
-    //   1. Full grey track pill  (track_l → track_r_x)
-    //   2. Accent fill pill      (track_l → thumb_cx)   — right end hidden under disc
-    //   3. C_BG3 thumb disc      — covers both track terminations completely
-    //   4. Animated accent dot   — drawn inside disc, clipped naturally by its size
-    //
-    // The disc (step 3) is always larger than track_h and is opaque, so every
-    // track boundary pixel — including AA sub-pixels — is overwritten.
-    // No masking, no clipping, no fringe.
+    // Paint layers in Z-order to hide AA sub-pixel artifacts at track terminations.
     gdip_init();
     let mut g: *mut GpGraphics = ptr::null_mut();
     GdipCreateFromHDC(mem_dc, &mut g);
@@ -667,14 +572,12 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
         fill_round_rect(g, empty_color, 0xFF, track_l, track_top, track_w, track_h, r);
     }
 
-    // Step 2: accent fill from the left end to the thumb centre.
-    // The right end of this pill runs past thumb_cx but is hidden by the disc.
+    // Step 2: accent fill.
     let accent_w = thumb_cx - track_l;
     if accent_w > 0 {
         fill_round_rect(g, accent, 0xFF, track_l, track_top, accent_w, track_h, r);
     }
 
-    // Step 3 + 4: thumb disc covering both track terminations, then accent dot.
     let pad     = s(3);
     let inner_d = (thumb_d - pad * 2).max(2);
     let inner_x = thumb_x + pad;
@@ -700,13 +603,12 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
     static mut CACHE_INNER:  CachedBrush = CachedBrush::empty();
     static mut CACHE_ACCENT: CachedBrush = CachedBrush::empty();
 
-    // Step 3: C_BG3 disc — covers both track terminations.
+    // Step 3: thumb disc.
     let inner_argb  = colorref_to_argb(C_BG3, 0xFF);
-    // SAFETY: single UI thread; addr_of_mut! avoids a &mut ref to mutable static.
     let inner_brush = (*std::ptr::addr_of_mut!(CACHE_INNER)).get(inner_argb);
     GdipFillEllipseI(g, inner_brush as _, thumb_x, thumb_y, thumb_d, thumb_d);
 
-    // Step 4: animated accent dot inside the disc.
+    // Step 4: animated accent dot.
     let idle_dot  = (10 * dpi / 96).max(3);
     let hover_dot = inner_d;
     let fill_raw  = GetPropW(hwnd, SLIDER_FILL_PROP).0 as isize;
@@ -720,14 +622,11 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
     let fill_x  = fill_cx - fill_d / 2;
     let fill_y  = fill_cy - fill_d / 2;
     let accent_argb  = colorref_to_argb(accent, 0xFF);
-    // SAFETY: single UI thread; addr_of_mut! avoids a &mut ref to mutable static.
     let accent_brush = (*std::ptr::addr_of_mut!(CACHE_ACCENT)).get(accent_argb);
     GdipFillEllipseI(g, accent_brush as _, fill_x, fill_y, fill_d, fill_d);
-    // Cached brushes intentionally not deleted here — reused next frame.
 
     GdipDeleteGraphics(g);
 
-    // ── Single blit: swap the completed back-buffer to the window. ────────────
     BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
 
     SelectObject(mem_dc, old_bmp);
@@ -782,6 +681,53 @@ pub unsafe extern "system" fn compare_btn_subclass_proc(
     }
 }
 
+// ── Action button hover subclass ─────────────────────────────────────────────
+//
+// Tracks mouse hover for regular push buttons (Minimize, Exit, Restore Defaults,
+// and the click-hold Compare button) so draw_dark_button_full can paint a
+// distinct hover background.  Uses the same begin_mouse_track / WM_MOUSELEAVE
+// pattern as the nav and slider subclasses.
+
+/// Window property set to non-null while the mouse is over the button.
+pub const ACTION_BTN_HOVER_PROP: PCWSTR = w!("BCT_ActionBtnHover");
+
+/// Attach the hover-tracking subclass to an action button.
+/// Call once after creating each push button (Minimize, Exit, Restore Defaults,
+/// Compare).
+pub unsafe fn install_action_btn_hover(hwnd: HWND) {
+    SetWindowSubclass(hwnd, Some(action_btn_subclass_proc), 4, 0);
+}
+
+pub unsafe extern "system" fn action_btn_subclass_proc(
+    hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
+    _subclass_id: usize, _ref_data: usize,
+) -> LRESULT {
+    let call_orig = || DefSubclassProc(hwnd, msg, wp, lp);
+
+    match msg {
+        WM_MOUSEMOVE => {
+            begin_mouse_track(hwnd, ACTION_BTN_HOVER_PROP);
+            call_orig()
+        }
+        WM_MOUSELEAVE => {
+            RemovePropW(hwnd, ACTION_BTN_HOVER_PROP);
+            InvalidateRect(hwnd, None, false);
+            call_orig()
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            // Repaint immediately on press/release so the pressed state is snappy.
+            InvalidateRect(hwnd, None, false);
+            call_orig()
+        }
+        WM_NCDESTROY => {
+            RemovePropW(hwnd, ACTION_BTN_HOVER_PROP);
+            RemoveWindowSubclass(hwnd, Some(action_btn_subclass_proc), 4);
+            call_orig()
+        }
+        _ => call_orig(),
+    }
+}
+
 // ── Navigation button subclass ───────────────────────────────────────────────
 //
 // Intercepts WM_SETFOCUS and WM_KILLFOCUS so the owner-draw path in
@@ -814,18 +760,7 @@ pub unsafe extern "system" fn nav_btn_subclass_proc(
         }
         WM_MOUSEMOVE => {
             // Set hover flag and request WM_MOUSELEAVE tracking if not already doing so.
-            let already = !GetPropW(hwnd, NAV_BTN_HOVER_PROP).0.is_null();
-            if !already {
-                SetPropW(hwnd, NAV_BTN_HOVER_PROP, HANDLE(1 as *mut _));
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize:      mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags:     TME_LEAVE,
-                    hwndTrack:   hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut tme);
-                InvalidateRect(hwnd, None, false);
-            }
+            begin_mouse_track(hwnd, NAV_BTN_HOVER_PROP);
             call_orig()
         }
         WM_MOUSELEAVE => {
@@ -871,7 +806,9 @@ unsafe fn combo_paint_border(hwnd: HWND) {
     GetWindowRect(hwnd, &mut rc);
     let w = rc.right  - rc.left;
     let h = rc.bottom - rc.top;
-    let pen = CreatePen(PS_SOLID, 1, C_SEP);
+    let hovered = !GetPropW(hwnd, w!("BCT_ComboHover")).0.is_null();
+    let border_color = if hovered { COLORREF(0x00888888) } else { C_SEP };
+    let pen = CreatePen(PS_SOLID, 1, border_color);
     let old_pen = SelectObject(hdc, pen);
     let old_br  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     Rectangle(hdc, 0, 0, w, h);
@@ -895,7 +832,9 @@ unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
     let old_bmp = SelectObject(mem_dc, mem_bmp);
 
     let btn_w = GetSystemMetrics(SM_CXVSCROLL).max(16);
-    let bg_br = CreateSolidBrush(C_BG3);
+    let hovered  = !GetPropW(hwnd, w!("BCT_ComboHover")).0.is_null();
+    let bg_color = if hovered { COLORREF(0x00363636) } else { C_BG3 };
+    let bg_br = CreateSolidBrush(bg_color);
 
     // Text-field background.
     let txt_rc = RECT { left: 0, top: 0, right: w - btn_w, bottom: h };
@@ -1097,17 +1036,7 @@ pub unsafe extern "system" fn combo_subclass_proc(
 
         // Re-stamp our border after any hover-driven NC repaint.
         WM_MOUSEMOVE => {
-            let already = !GetPropW(hwnd, w!("BCT_ComboHover")).0.is_null();
-            if !already {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize:      mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags:     TME_LEAVE,
-                    hwndTrack:   hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut tme);
-                SetPropW(hwnd, w!("BCT_ComboHover"), HANDLE(1 as *mut _));
-            }
+            begin_mouse_track(hwnd, w!("BCT_ComboHover"));
             let r = call_orig();
             combo_paint_border(hwnd);
             r
@@ -1488,6 +1417,7 @@ pub unsafe fn draw_dark_button_full(
     h_btn_toggle: HWND,
     chk_auto_hz_state: bool, chk_startup_state: bool, chk_taskbar_dim_enabled: bool,
     btn_toggle_active: bool,
+    is_hovered: bool,
 ) {
     let hdc    = di.hDC;
     let rc     = di.rcItem;
@@ -1535,13 +1465,16 @@ pub unsafe fn draw_dark_button_full(
 
         // ── Shared pill helper (closure-like macro pattern) ───────────────────
         // Draws track + thumb at the given position using GDI+ for smooth edges.
+        let is_hovered = !GetPropW(di.hwndItem, TOGGLE_HOVER_PROP).0.is_null();
         let draw_pill = |tr_x: i32, tr_y: i32, tr_h: i32, tr_w: i32| {
             let th_pad = (2 * dpi / 96).max(1);
             let th_d   = tr_h - th_pad * 2;
             let th_y   = tr_y + th_pad;
 
             let track_color = if is_dis { COLORREF(0x00444444) }
+                              else if checked && is_hovered { lighten_colorref(accent, 40) }
                               else if checked { accent }
+                              else if is_hovered { COLORREF(0x00707070) }
                               else { COLORREF(0x00555555) };
             let thumb_color = if is_dis { COLORREF(0x00888888) }
                               else if checked { C_BG } else { C_FG };
@@ -1655,13 +1588,28 @@ pub unsafe fn draw_dark_button_full(
     // ── Regular push buttons ─────────────────────────────────────────────────
     let is_active = di.hwndItem == h_btn_toggle && btn_toggle_active;
 
+    // Read hover state from the window property set by action_btn_subclass_proc.
+    // The caller may also pass `is_hovered` directly (e.g. when it already has
+    // the flag from AppState), so OR both sources together.
+    let btn_hovered = is_hovered
+        || !GetPropW(di.hwndItem, ACTION_BTN_HOVER_PROP).0.is_null();
+
     let (bg, border, text_color) = if is_dis {
         (COLORREF(0x00222222), COLORREF(0x00333333), COLORREF(0x00555555))
     } else if is_active {
-        let bg = if is_sel { C_BTN_ACTIVE_PRESS } else { C_BTN_ACTIVE };
+        let bg = if is_sel {
+            C_BTN_ACTIVE_PRESS
+        } else if btn_hovered {
+            lighten_colorref(C_BTN_ACTIVE, 20)
+        } else {
+            C_BTN_ACTIVE
+        };
         (bg, C_BTN_ACTIVE_BORDER, C_BTN_ACTIVE_TEXT)
     } else if is_sel {
         (C_BTN_PRESS, C_BTN_BORDER, C_BTN_TEXT)
+    } else if btn_hovered {
+        // Subtle hover: slightly lighter background and brighter border.
+        (lighten_colorref(C_BTN_NORMAL, 18), lighten_colorref(C_BTN_BORDER, 40), C_BTN_TEXT)
     } else {
         (C_BTN_NORMAL, C_BTN_BORDER, C_BTN_TEXT)
     };
@@ -1717,21 +1665,27 @@ pub unsafe fn draw_hdr_toggle_switch(
     let tr_x   = rc.right - tr_w - pad * 2;
     let tr_y   = rc.top + (h - tr_h) / 2;
 
-    // Label.
+    // Label — read from the window text so any button using this painter
+    // shows its own label rather than a hardcoded string.
     SetTextColor(hdc, C_FG);
-    let mut lbl: Vec<u16> = "Enable HDR\0".encode_utf16().collect();
+    let mut lbl_buf = [0u16; 128];
+    let lbl_len = GetWindowTextW(di.hwndItem, &mut lbl_buf) as usize;
     let mut lbl_rc = RECT {
         left:   rc.left,
         top:    rc.top,
         right:  tr_x - (4 * dpi / 96).max(4),
         bottom: rc.bottom,
     };
-    DrawTextW(hdc, &mut lbl, &mut lbl_rc,
+    DrawTextW(hdc, &mut lbl_buf[..lbl_len], &mut lbl_rc,
         DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
 
     // Pill track + thumb — GDI+ for antialiased edges, matching draw_pill.
     let accent      = get_accent_color();
-    let track_color = if checked { accent } else { COLORREF(0x00555555) };
+    let is_hovered  = !GetPropW(di.hwndItem, TOGGLE_HOVER_PROP).0.is_null();
+    let track_color = if checked && is_hovered { lighten_colorref(accent, 40) }
+                      else if checked { accent }
+                      else if is_hovered { COLORREF(0x00707070) }
+                      else { COLORREF(0x00555555) };
     let thumb_color = if checked { C_BG } else { C_FG };
 
     gdip_init();
@@ -1864,49 +1818,58 @@ unsafe fn paint_tab_header(hwnd: HWND, hdc: HDC) {
     SelectObject(hdc, old_font);
     DeleteObject(font);
 }
-// ── HDR toggle button: restrict clicks to the pill area only ─────────────────
+// ── Toggle pill subclass (shared by HDR and Dimmer toggle buttons) ────────────
 //
-// The button fills the full col_w so the label can be drawn inside it, but we
-// only want the pill on the right to be clickable. WM_NCHITTEST returning
-// HTTRANSPARENT passes the click through to the parent (no action); returning
-// HTCLIENT keeps it as a normal button press.
+// ref_data == 0 → pill is RIGHT-aligned (HDR toggle, matches draw_hdr_toggle_switch)
+// ref_data == 1 → pill is LEFT-aligned  (Dimmer toggle)
 //
-// The pill geometry must mirror draw_hdr_toggle_switch exactly:
-//   pill_h = round(h * 0.55)
-//   pill_w = round(pill_h * 2.0)
-//   pill_x = w - pill_w - pad        where pad = round(h * 0.18)
+// The pill geometry mirrors draw_hdr_toggle_switch / draw_pill exactly:
+//   box_sz = (14*dpi/96).max(11)   tr_w = (box_sz*2).max(22)
+//   HDR:    pill_x = w - tr_w - pad*2
+//   Dimmer: pill_x = 0
+
+/// Window property used by toggle-pill subclass procs to record hover state.
+/// Non-null = hovered; null = not hovered.
+const TOGGLE_HOVER_PROP: PCWSTR = w!("BCT_ToggleHover");
+
+unsafe fn toggle_pill_hit(hwnd: HWND, lp: LPARAM, right_aligned: bool) -> bool {
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc);
+    let w = rc.right  - rc.left;
+    let h = rc.bottom - rc.top;
+    let dpi    = GetDpiForWindow(hwnd).max(96) as i32;
+    let box_sz = (14 * dpi / 96).max(11);
+    let pad    = (2  * dpi / 96).max(2);
+    let tr_h   = box_sz;
+    let tr_w   = (box_sz * 2).max(22);
+    let pill_x = if right_aligned { w - tr_w - pad * 2 } else { 0 };
+    let pill_y = (h - tr_h) / 2;
+    let screen_pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32,
+                             y: (lp.0 >> 16)    as i16 as i32 };
+    let mut pt = screen_pt;
+    ScreenToClient(hwnd, &mut pt);
+    pt.x >= pill_x && pt.x < pill_x + tr_w && pt.y >= pill_y && pt.y < pill_y + tr_h
+}
+
 pub unsafe extern "system" fn hdr_toggle_subclass_proc(
     hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
-    _subclass_id: usize, _ref_data: usize,
+    _subclass_id: usize, ref_data: usize,
 ) -> LRESULT {
+    let right_aligned = ref_data == 0;
     match msg {
-        WM_NCHITTEST => {
-            let mut rc = RECT::default();
-            GetClientRect(hwnd, &mut rc);
-            let w = rc.right  - rc.left;
-            let h = rc.bottom - rc.top;
-
-            // Mirror draw_hdr_toggle_switch pill geometry exactly.
-            let dpi    = GetDpiForWindow(hwnd).max(96) as i32;
-            let box_sz = (14 * dpi / 96).max(11);
-            let pad    = (2  * dpi / 96).max(2);
-            let tr_h   = box_sz;
-            let tr_w   = (box_sz * 2).max(22);
-            let pill_x = w - tr_w - pad * 2;
-            let pill_y = (h - tr_h) / 2;
-
-            let screen_pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32,
-                                     y: (lp.0 >> 16)    as i16 as i32 };
-            let mut pt = screen_pt;
-            ScreenToClient(hwnd, &mut pt);
-
-            let in_pill = pt.x >= pill_x && pt.x < pill_x + tr_w
-                       && pt.y >= pill_y && pt.y < pill_y + tr_h;
-
-            if in_pill { LRESULT(HTCLIENT as isize) }
-            else       { LRESULT(HTTRANSPARENT as isize) }
+        WM_MOUSEMOVE => {
+            begin_mouse_track(hwnd, TOGGLE_HOVER_PROP);
+            DefSubclassProc(hwnd, msg, wp, lp)
         }
-        // Suppress the dashed focus rectangle Windows draws on owner-draw buttons.
+        WM_MOUSELEAVE => {
+            RemovePropW(hwnd, TOGGLE_HOVER_PROP);
+            InvalidateRect(hwnd, None, false);
+            DefSubclassProc(hwnd, msg, wp, lp)
+        }
+        WM_NCHITTEST => {
+            if toggle_pill_hit(hwnd, lp, right_aligned) { LRESULT(HTCLIENT as isize) }
+            else { LRESULT(HTTRANSPARENT as isize) }
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             InvalidateRect(hwnd, None, false);
             LRESULT(0)
@@ -1915,42 +1878,10 @@ pub unsafe extern "system" fn hdr_toggle_subclass_proc(
     }
 }
 
-// ── Dimmer toggle: restrict clicks to the LEFT-aligned pill area only ────────
-//
-// The pill is drawn at rc.left (flush left), width = (box_sz*2).max(22),
-// height = box_sz = (14*dpi/96).max(11), vertically centred.
+/// Alias used by the dimmer toggle — same proc, ref_data = 1 (left-aligned pill).
 pub unsafe extern "system" fn dimmer_toggle_subclass_proc(
     hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
-    _subclass_id: usize, _ref_data: usize,
+    subclass_id: usize, _ref_data: usize,
 ) -> LRESULT {
-    match msg {
-        WM_NCHITTEST => {
-            let mut rc = RECT::default();
-            GetClientRect(hwnd, &mut rc);
-            let h = rc.bottom - rc.top;
-
-            let dpi    = GetDpiForWindow(hwnd).max(96) as i32;
-            let box_sz = (14 * dpi / 96).max(11);
-            let tr_h   = box_sz;
-            let tr_w   = (box_sz * 2).max(22);
-            let pill_x = 0i32;          // flush left — mirrors draw code in ui_drawing.rs
-            let pill_y = (h - tr_h) / 2;
-
-            let screen_pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32,
-                                     y: (lp.0 >> 16)    as i16 as i32 };
-            let mut pt = screen_pt;
-            ScreenToClient(hwnd, &mut pt);
-
-            let in_pill = pt.x >= pill_x && pt.x < pill_x + tr_w
-                       && pt.y >= pill_y && pt.y < pill_y + tr_h;
-
-            if in_pill { LRESULT(HTCLIENT as isize) }
-            else       { LRESULT(HTTRANSPARENT as isize) }
-        }
-        WM_SETFOCUS | WM_KILLFOCUS => {
-            InvalidateRect(hwnd, None, false);
-            LRESULT(0)
-        }
-        _ => DefSubclassProc(hwnd, msg, wp, lp),
-    }
+    hdr_toggle_subclass_proc(hwnd, msg, wp, lp, subclass_id, 1)
 }

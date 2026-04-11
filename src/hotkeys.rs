@@ -19,7 +19,7 @@ use windows::Win32::{
             CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
             HHOOK, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
             WH_KEYBOARD_LL, WH_MOUSE_LL,
-            WM_HOTKEY, WM_KEYUP, WM_MBUTTONDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+            WM_HOTKEY, WM_KEYUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYUP, WM_XBUTTONDOWN,
         },
     },
 };
@@ -35,6 +35,7 @@ pub const HK_DECREASE:     usize = 4;
 pub const HK_INCREASE:     usize = 5;
 pub const HK_DIM_DECREASE: usize = 6;
 pub const HK_DIM_INCREASE: usize = 7;
+pub const HK_TOGGLE_HDR:   usize = 8;
 
 // ── parse_hotkey ──────────────────────────────────────────────────────────────
 
@@ -164,19 +165,20 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
 /// visibility issue).
 pub unsafe fn register_hotkeys(
     ini: &crate::profile_manager::ProfileManager,
-    mouse_hotkeys: &mut [u32; 8],
+    mouse_hotkeys: &mut [u32; 9],
     hwnd: HWND,
 ) {
     use crate::tab_hotkeys::is_mouse_sentinel;
 
     // Unregister all keyboard hotkeys.
     for id in [HK_TOGGLE_DIM, HK_TOGGLE_CRUSH, HK_HOLD_COMPARE,
-               HK_DECREASE,   HK_INCREASE,      HK_DIM_DECREASE, HK_DIM_INCREASE] {
+               HK_DECREASE,   HK_INCREASE,      HK_DIM_DECREASE, HK_DIM_INCREASE,
+               HK_TOGGLE_HDR] {
         UnregisterHotKey(hwnd, id as i32);
     }
     // Clear all mouse slots; we'll repopulate below.
     for slot in &MOUSE_HK_SLOTS { slot.store(0, Ordering::SeqCst); }
-    *mouse_hotkeys = [0u32; 8];
+    *mouse_hotkeys = [0u32; 9];
 
     let sec = "Hotkeys";
     let bindings = [
@@ -187,6 +189,7 @@ pub unsafe fn register_hotkeys(
         (HK_INCREASE,     ini.read(sec, "IncreaseBlackCrush",  "None")),
         (HK_DIM_DECREASE, ini.read(sec, "DecreaseDimLevel",    "None")),
         (HK_DIM_INCREASE, ini.read(sec, "IncreaseDimLevel",    "None")),
+        (HK_TOGGLE_HDR,   ini.read(sec, "ToggleHDR",           "None")),
     ];
 
     let mut any_mouse = false;
@@ -279,7 +282,8 @@ static MOUSE_HK_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Packed mouse-button bindings shared with the hook proc.
 /// Index = HK_* id (1–7); value = MB_* sentinel (0 = unbound).
 /// Each slot is an independent AtomicU64 encoding (id << 32) | sentinel.
-pub static MOUSE_HK_SLOTS: [std::sync::atomic::AtomicU64; 8] = [
+pub static MOUSE_HK_SLOTS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -322,6 +326,18 @@ unsafe extern "system" fn mouse_ll_hook_proc(
     use crate::tab_hotkeys::{MB_MIDDLE, xbutton_index_to_sentinel};
 
     if code >= 0 {
+        // Reset cursor-hide idle clock on any mouse movement.
+        if wp.0 as u32 == WM_MOUSEMOVE {
+            crate::tab_system::cursor_touch();
+            // Restore cursors immediately on movement — don't wait for the 1s
+            // timer tick. cursor_hidden is checked atomically to avoid calling
+            // SPI_SETCURSORS on every move event when already visible.
+            if crate::tab_system::CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                crate::tab_system::CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+                unsafe { crate::tab_system::restore_system_cursors() };
+            }
+        }
+
         let sentinel: Option<u32> = match wp.0 as u32 {
             WM_MBUTTONDOWN => Some(MB_MIDDLE),
             WM_XBUTTONDOWN => {

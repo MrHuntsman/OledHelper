@@ -100,7 +100,7 @@ pub const DEFAULT_BLACK: i32 = 0;
 
 // Minimum window size in logical pixels (96 DPI baseline).
 pub const MIN_WIN_W: i32 = 700;
-pub const MIN_WIN_H: i32 = 740;
+pub const MIN_WIN_H: i32 = 720;
 
 // ── Startup shortcut ──────────────────────────────────────────────────────────
 // CSIDL_STARTUP is exported by windows-rs Shell::* — do not redefine it here.
@@ -144,8 +144,24 @@ pub const IDC_HK_EDT_DIM_INCREASE:  usize = 229;
 pub const IDC_HK_CLR_DIM_DECREASE:  usize = 230;
 pub const IDC_HK_CLR_DIM_INCREASE:  usize = 231;
 
+pub const IDC_HK_EDT_TOGGLE_HDR: usize = 232;
+pub const IDC_HK_CLR_TOGGLE_HDR: usize = 233;
+
+// ── Mouse / cursor-hide section ───────────────────────────────────────────────
+pub const IDC_SYS_DDL_CURSOR_HIDE: usize = 0x0A20;
+
+/// 1-second tick: checks idle duration and hides/restores cursor.
+/// Killed when the dropdown is set to "Never" (index 0).
+pub const TIMER_CURSOR_HIDE: usize = 11;
+
 /// About tab nav button.
 pub const IDC_NAV_BTN_4: usize = 1032;
+
+/// System tab nav button (tab 2 — inserted between Taskbar Dimmer and Hotkeys).
+pub const IDC_NAV_BTN_5: usize = 1033;
+
+/// Taskbar auto-hide toggle button in the System tab.
+pub const IDC_SYS_BTN_TASKBAR_AUTOHIDE: usize = 245;
 
 /// "Check for updates" button in the About tab.
 pub const IDC_ABOUT_BTN_CHECK: usize = 240;
