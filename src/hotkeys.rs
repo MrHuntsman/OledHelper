@@ -208,10 +208,11 @@ pub unsafe fn register_hotkeys(
         }
     }
 
-    if any_mouse {
+    if any_mouse || crate::tab_system::CURSOR_HIDE_ENABLED.load(Ordering::SeqCst) {
         ensure_mouse_hook_installed(hwnd);
     } else {
-        // No mouse bindings — uninstall the hook to avoid unnecessary overhead.
+        // No mouse bindings and cursor-hide is off — uninstall the hook to
+        // avoid unnecessary overhead.
         uninstall_mouse_hook();
     }
 }

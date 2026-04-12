@@ -45,4 +45,5 @@ features = [
 winres = "0.1"
 
 [dependencies]
-png = "0.17"
+png    = "0.17"
+minreq = { version = "2", features = ["https"] }

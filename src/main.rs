@@ -85,8 +85,19 @@ unsafe fn run_app() {
         );
         return;
     }
-    // Hold the handle for the process lifetime — dropped (and released) at end of run_app.
-    let _mutex = mutex_handle;
+    // Wrap the raw HANDLE in a newtype whose Drop calls CloseHandle.
+    // HANDLE is Copy, so a bare `let _mutex = mutex_handle` followed by
+    // `drop(_mutex)` is a no-op — the kernel object would never be released
+    // until the process exits.  OwnedHandle guarantees release on drop.
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.0.is_null() {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
+    }
+    let _mutex = OwnedHandle(mutex_handle);
 
     // ── Panic hook: reset gamma ramp on unexpected crash ──────────────────────
     let default_hook = std::panic::take_hook();
@@ -109,15 +120,46 @@ unsafe fn run_app() {
 
     gamma_ramp::reset_display_ramp();
 
-    // Check restart flag before _mutex drops so we know it was set intentionally,
-    // but spawn AFTER the drop below so the new instance can acquire the mutex.
+    // Capture flags before _mutex drops (reads are safe here), but all
+    // spawning happens after the drop so the new instance can acquire the mutex.
     let should_restart = app::RESTART_ON_EXIT.load(std::sync::atomic::Ordering::SeqCst);
+    let update_path = app::UPDATE_RELAUNCH_PATH.lock().ok()
+        .and_then(|mut g| g.take());
+    let old_exe_path = app::OLD_EXE_PATH.lock().ok()
+        .and_then(|mut g| g.take());
 
-    // _mutex drops here, releasing the kernel mutex
+    // Drop the mutex explicitly here — before any spawn — so the new instance
+    // can acquire it successfully.  Without this explicit drop, _mutex lives
+    // until the closing brace of run_app(), which is after the spawn() calls,
+    // causing the new process to see ERROR_ALREADY_EXISTS and show the
+    // "already running" message box.
+    drop(_mutex);
 
     if should_restart {
+        // Tray "Restart" — relaunch the current exe.
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::process::Command::new(exe).spawn();
+        }
+    } else if let Some(path) = update_path {
+        // Self-update — launch the newly-installed exe.
+        let _ = std::process::Command::new(&path).spawn();
+
+        // Delete OledHelper_old.exe now that the mutex is released and the
+        // new process has been spawned.  This process is about to exit, so
+        // Windows will release the exe image section handle momentarily,
+        // allowing the delete to succeed.  We retry briefly in a background
+        // thread and sleep to let it finish before the process exits.
+        if let Some(old_path) = old_exe_path {
+            std::thread::spawn(move || {
+                let p = std::path::Path::new(&old_path);
+                for _ in 0..10 {
+                    if std::fs::remove_file(p).is_ok() { return; }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                let _ = std::fs::remove_file(p);
+            });
+            // Give the background thread a moment to finish before we exit.
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 }

@@ -46,6 +46,7 @@ pub const C_DDL_ARROW: COLORREF = COLORREF(0x00DDDDDD);
 #[allow(dead_code)] pub const SS_CENTERIMAGE: u32 = 0x0000_0200; // vertically centres text in static controls
 pub const SS_NOPREFIX: u32 = 0x0000_0080;
 pub const SS_BLACKRECT:u32 = 0x0000_0004;
+pub const SS_NOTIFY:   u32 = 0x0000_0100;
 
 // ── TrackBar messages ─────────────────────────────────────────────────────────
 // TBM_GETPOS is NOT exported by windows-rs (only PBM_GETPOS exists there).
@@ -163,9 +164,6 @@ pub const IDC_NAV_BTN_5: usize = 1033;
 /// Taskbar auto-hide toggle button in the System tab.
 pub const IDC_SYS_BTN_TASKBAR_AUTOHIDE: usize = 245;
 
-/// "Check for updates" button in the About tab.
-pub const IDC_ABOUT_BTN_CHECK: usize = 240;
-
 /// Hotkey ID for the debug-mode force-raise overlay action (key: '1').
 /// Registered only while the debug tab is active; unregistered on tab switch.
 pub const HK_DEBUG_FORCE_RAISE: i32 = 50;
@@ -186,3 +184,9 @@ pub const WM_MOUSE_CLICK_LOG: u32 = WM_USER + 10;
 /// Mouse click log IDs — kept for ABI stability but controls are now unified into h_lst_zlog.
 #[allow(dead_code)] pub const IDC_LST_CLICK_LOG:   usize = 243;
 #[allow(dead_code)] pub const IDC_BTN_CLICK_CLEAR: usize = 244;
+// ── Auto-update ───────────────────────────────────────────────────────────────
+pub const IDC_ABOUT_BTN_UPDATE: usize = 250;
+/// Posted by download thread each chunk: wparam = bytes_received, lparam = total_bytes.
+pub const WM_DOWNLOAD_PROGRESS: u32 = WM_USER + 21;
+/// Posted by download thread on completion: wparam = 1 success, 0 = failure.
+pub const WM_DOWNLOAD_DONE:     u32 = WM_USER + 22;

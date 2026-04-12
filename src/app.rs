@@ -128,6 +128,7 @@ pub struct AppState {
     tab_header_icons: crate::nav_icons::TabHeaderIcons,
     /// 0 = Black Crush Tweak, 1 = Taskbar Dimmer, 2 = Debug
     active_tab:   usize,
+    pub update_available: bool,
 
     // ── Shared brushes / fonts (kept alive for WM_PAINT lifetime) ────────────
     bg_brush:    HBRUSH,
@@ -645,6 +646,8 @@ unsafe extern "system" fn wnd_proc(
                 ShowWindow(st.h_nav_btn[3], SW_HIDE);
                 KillTimer(hwnd, TIMER_DEBUG_REFRESH);
             }
+            // Fire the GitHub update check once in the background.
+            st.about.spawn_update_check(hwnd);
         }
     }
     LRESULT(0)
@@ -864,37 +867,37 @@ unsafe extern "system" fn wnd_proc(
                         GetFocus() == st.h_nav_btn[0],
                         !GetPropW(st.h_nav_btn[0], NAV_BTN_HOVER_PROP).0.is_null(),
                         st.h_app_icon, "",
-                        st.nav_icons.crush);
+                        st.nav_icons.crush, false);
                 } else if di.hwndItem == st.h_nav_btn[1] {
                     draw_nav_item(di, st.active_tab == 1,
                         GetFocus() == st.h_nav_btn[1],
                         !GetPropW(st.h_nav_btn[1], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "⊞",
-                        st.nav_icons.dimmer);
+                        st.nav_icons.dimmer, false);
                 } else if di.hwndItem == st.h_nav_btn[5] {
                     draw_nav_item(di, st.active_tab == 2,
                         GetFocus() == st.h_nav_btn[5],
                         !GetPropW(st.h_nav_btn[5], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "⚙",
-                        st.nav_icons.system);
+                        st.nav_icons.system, false);
                 } else if di.hwndItem == st.h_nav_btn[2] {
                     draw_nav_item(di, st.active_tab == 3,
                         GetFocus() == st.h_nav_btn[2],
                         !GetPropW(st.h_nav_btn[2], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "⌨",
-                        st.nav_icons.hotkeys);
+                        st.nav_icons.hotkeys, false);
                 } else if di.hwndItem == st.h_nav_btn[3] {
                     draw_nav_item(di, st.active_tab == 4,
                         GetFocus() == st.h_nav_btn[3],
                         !GetPropW(st.h_nav_btn[3], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "🐛",
-                        st.nav_icons.debug);
+                        st.nav_icons.debug, false);
                 } else if di.hwndItem == st.h_nav_btn[4] {
                     draw_nav_item(di, st.active_tab == 5,
                         GetFocus() == st.h_nav_btn[4],
                         !GetPropW(st.h_nav_btn[4], NAV_BTN_HOVER_PROP).0.is_null(),
                         HICON(ptr::null_mut()), "ℹ",
-                        st.nav_icons.about);
+                        st.nav_icons.about, st.update_available);
                 } else if di.hwndItem == st.debug.h_chk_suppress_fs {
                     draw_dark_button_full(di,
                         st.debug.h_chk_suppress_fs, HWND(ptr::null_mut()),
@@ -951,6 +954,11 @@ unsafe extern "system" fn wnd_proc(
                     return LRESULT(st.bg_brush.0 as isize);
                 }
                 if ctrl == st.about.h_lbl_link {
+                    SetBkColor(hdc, C_BG);
+                    SetTextColor(hdc, C_ACCENT);
+                    return LRESULT(st.bg_brush.0 as isize);
+                }
+                if ctrl == st.about.h_lbl_check_info && st.update_available {
                     SetBkColor(hdc, C_BG);
                     SetTextColor(hdc, C_ACCENT);
                     return LRESULT(st.bg_brush.0 as isize);
@@ -1052,6 +1060,34 @@ unsafe extern "system" fn wnd_proc(
                     apply_ramp(st, hwnd);
                     InvalidateRect(st.crush.h_btn_toggle, None, false);
                 }
+            }
+            LRESULT(0)
+        }
+
+        crate::tab_about::WM_UPDATE_RESULT => {
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                st.about.on_update_result(hwnd, wparam.0, lparam.0);
+                if wparam.0 == 1 {
+                    st.update_available = true;
+                    InvalidateRect(st.h_nav_btn[4], None, false);
+                    if st.active_tab == 5 {
+                        app_layout::apply(st, hwnd);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_DOWNLOAD_PROGRESS => {
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                st.about.on_download_progress(wparam.0, lparam.0 as usize);
+            }
+            LRESULT(0)
+        }
+
+        WM_DOWNLOAD_DONE => {
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                st.about.on_download_done(hwnd, wparam.0 == 1);
             }
             LRESULT(0)
         }
@@ -1405,9 +1441,24 @@ unsafe extern "system" fn wnd_proc(
         WM_SETCURSOR => {
             if crate::tab_system::CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::tab_system::CURSOR_HIDDEN.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Reset the idle clock so the 1-second timer doesn't immediately
+                // re-hide the cursor on the next tick.  Without this, CURSOR_LAST_MOVE_MS
+                // still holds the old stale timestamp and idle_ms stays above the
+                // threshold, causing the cursor to vanish again almost instantly.
+                crate::tab_system::cursor_touch();
                 if let Some(st) = borrow_state::<AppState>(hwnd) {
                     st.system.cursor_hidden = false;
                     crate::tab_system::restore_system_cursors();
+                }
+            }
+            // Show a hand cursor when hovering over the GitHub link label.
+            let cursor_hwnd = HWND(wparam.0 as *mut _);
+            if let Some(st) = borrow_state::<AppState>(hwnd) {
+                if cursor_hwnd == st.about.h_lbl_link
+                    || (cursor_hwnd == st.about.h_lbl_check_info && st.update_available) {
+                    let hand = LoadCursorW(None, IDC_HAND).unwrap_or_default();
+                    SetCursor(hand);
+                    return LRESULT(1);
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1534,6 +1585,9 @@ let hotkeys = HotkeysTab::new(
         let idx = crate::tab_system::cursor_hide_to_index(secs);
         system.cursor_hide_idx = idx;
         SendMessageW(system.h_ddl_cursor_hide, CB_SETCURSEL, WPARAM(idx), LPARAM(0));
+        // Sync the enabled flag so register_hotkeys (called below) knows to keep
+        // the WH_MOUSE_LL hook alive for idle-clock updates even with no mouse hotkeys.
+        crate::tab_system::CURSOR_HIDE_ENABLED.store(idx > 0, std::sync::atomic::Ordering::Relaxed);
         // Timer is armed below after state is fully built.
     }
     let about = AboutTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
@@ -1551,7 +1605,7 @@ let hotkeys = HotkeysTab::new(
         crush, dimmer, system, hotkeys, debug, about,
         h_chk_startup, h_btn_quit, h_btn_minimize, h_btn_hdr_toggle,
         h_lbl_status, h_lbl_error, h_sep_vert, h_sep_h, h_nav_btn,
-        h_app_icon, active_tab: 0,
+        h_app_icon, active_tab: 0, update_available: false,
         nav_icons,
         tab_header_icons,
         bg_brush, bg3_brush, sep_brush,
@@ -1700,6 +1754,11 @@ unsafe fn show_tab(st: &mut AppState, hwnd: HWND) {
     st.hotkeys.group.set_visible(tab == 3);
     st.debug.group.set_visible(tab == 4);
     st.about.group.set_visible(tab == 5);
+    // Re-layout when switching to About so changelog is positioned if update arrived
+    // while a different tab was active.
+    if tab == 5 {
+        app_layout::apply(st, hwnd);
+    }
 
     // Arm TIMER_DEBUG_REFRESH only while the debug tab is visible (and only in
     // --debug mode — is_debug_mode() is false in production so the timer is
@@ -1729,6 +1788,21 @@ static DEBUG_MODE: std::sync::atomic::AtomicBool =
 pub static RESTART_ON_EXIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set by `on_download_done` to the path of the freshly-installed exe.
+/// main.rs reads this *after* `run()` returns (i.e. after the named mutex is
+/// released) and spawns the new process then — avoiding the "already running"
+/// collision that occurs when the new instance starts while the old one still
+/// holds the mutex.
+pub static UPDATE_RELAUNCH_PATH: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Set by `on_download_done` to the path of the backup exe (`OledHelper_old.exe`).
+/// main.rs deletes this file *after* spawning the new process — at that point
+/// the old process's image is no longer needed and the file handle Windows
+/// holds on the running exe has been replaced by the new exe's handle.
+pub static OLD_EXE_PATH: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
 pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(Ordering::Relaxed)
 }
@@ -1754,8 +1828,16 @@ fn nav_btn_to_tab(id: usize) -> Option<usize> {
 
 unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctrl: HWND) {
     match id {
-        IDC_ABOUT_BTN_CHECK if notify == BN_CLICKED as u32 => {
-            st.about.on_check_updates();
+        // STN_CLICKED on the update-available label — open releases page.
+        _ if _ctrl == st.about.h_lbl_check_info && notify == 0 => {
+            st.about.on_open_releases();
+        }
+        IDC_ABOUT_BTN_UPDATE if notify == BN_CLICKED as u32 => {
+            st.about.on_update_now(hwnd);
+        }
+        // STN_CLICKED on the GitHub link label.
+        _ if _ctrl == st.about.h_lbl_link && notify == 0 => {
+            st.about.on_open_link();
         }
         IDC_SYS_BTN_TASKBAR_AUTOHIDE if notify == BN_CLICKED as u32 => {
             let msg = st.system.on_toggle_taskbar_autohide();

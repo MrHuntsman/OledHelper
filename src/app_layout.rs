@@ -84,6 +84,20 @@ impl LayoutGrid {
         }
     }
 
+    /// Explicitly hide a control in the deferred batch.
+    /// Use for controls that must never paint outside their own tab.
+    fn hide(&mut self, control: HWND) {
+        if control.0.is_null() || self.hdwp.0.is_null() { return; }
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::SWP_HIDEWINDOW;
+            self.hdwp = DeferWindowPos(
+                self.hdwp, control, None,
+                -32000, -32000, 1, 1,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOCOPYBITS | SWP_HIDEWINDOW,
+            ).unwrap_or(self.hdwp);
+        }
+    }
+
     fn place_with_gap(&mut self, sy: &mut i32, x: i32, width: i32, height: i32, control: HWND, gap: i32) {
         self.set(control, x, *sy, width, height);
         *sy += height + gap;
@@ -523,14 +537,34 @@ impl LayoutGrid {
             st.about.h_lbl_sect_update, self.s(4));
         self.place_separator(&mut y, self.main_x, self.main_w, st.about.h_sep_update);
 
-        let btn_w = self.s(260);
-        self.set(st.about.h_btn_check,
-            self.main_x, y, btn_w, self.s(32));
-        y += self.s(32) + self.s(8);
-
-        // Info label below the button (empty until a check is triggered).
+        // Status label: "Checking…", "Up to date.", or "vX.Y available".
         self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
-            st.about.h_lbl_check_info, 0);
+            st.about.h_lbl_check_info, self.s(8));
+
+        // "Update Now" button + download progress label (hidden until update found).
+        let btn_w = self.s(140);
+        self.set(st.about.h_btn_update, self.main_x, y, btn_w, self.s(28));
+        self.set(st.about.h_lbl_dl_status,
+            self.main_x + btn_w + self.s(10), y,
+            self.main_w - btn_w - self.s(10), self.s(28));
+        y += self.s(28) + self.s(14);
+
+        // ── "Changelog" section — only laid out when an update is available ────
+        if st.update_available {
+            self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
+                st.about.h_lbl_sect_changelog, self.s(4));
+            self.place_separator(&mut y, self.main_x, self.main_w, st.about.h_sep_changelog);
+
+            // Release notes label — word-wrapped via SS_EDITCONTROL.
+            self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(200),
+                st.about.h_lbl_changelog, 0);
+        } else {
+            // Explicitly hide changelog controls so they cannot bleed through
+            // onto other tabs during window resize.
+            self.hide(st.about.h_lbl_sect_changelog);
+            self.hide(st.about.h_sep_changelog);
+            self.hide(st.about.h_lbl_changelog);
+        }
     }
 
 }

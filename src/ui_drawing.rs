@@ -1236,6 +1236,7 @@ pub unsafe fn draw_nav_item(
     icon_hicon:  HICON,
     icon_glyph:  &str,
     icon_bitmap: Option<HBITMAP>,
+    badge: bool,
 ) {
     let hdc = di.hDC;
     let rc  = di.rcItem;
@@ -1398,14 +1399,39 @@ pub unsafe fn draw_nav_item(
     let text_x = icon_x + icon_size + icon_gap;
     let mut buf = [0u16; 128];
     let len = GetWindowTextW(di.hwndItem, &mut buf) as usize;
+
+    // When a badge is shown, pre-measure its width and shrink the label rect
+    // so the label never overlaps the badge.
+    let badge_text: Vec<u16> = "Update".encode_utf16().collect();
+    let badge_reserve = if badge {
+        let mut rc_b = RECT { left: 0, top: 0, right: 500, bottom: 40 };
+        let mut bw = badge_text.clone();
+        DrawTextW(hdc, &mut bw, &mut rc_b,
+            DT_LEFT | DT_SINGLELINE | DT_CALCRECT);
+        rc_b.right + s(2)
+    } else { 0 };
+
     let mut rc_text = RECT {
         left:   text_x,
         top:    rc.top,
-        right:  rc.right - s(4),
+        right:  rc.right - s(4) - badge_reserve,
         bottom: rc.bottom,
     };
     DrawTextW(hdc, &mut buf[..len], &mut rc_text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    // ── Badge (accent colour) ─────────────────────────────────────────────
+    if badge {
+        let badge_x = rc.right - s(4) - badge_reserve;
+        let mut rc_dot = RECT {
+            left: badge_x, top: rc.top,
+            right: rc.right - s(2), bottom: rc.bottom,
+        };
+        let mut bw = badge_text.clone();
+        SetTextColor(hdc, C_ACCENT);
+        DrawTextW(hdc, &mut bw, &mut rc_dot,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
 }
 
 /// Full dark-button / checkbox painter used by the main window's WM_DRAWITEM.
