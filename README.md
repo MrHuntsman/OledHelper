@@ -7,11 +7,13 @@ Windows utility to complement OLED TV/monitors. You can adjust black level per r
 
 ## Features
 
-**Black Crush Tweak** — Corrects near-black by applying a custom gamma ramp (Reinhard shadow curve) restoring shadow detail. Includes a live Direct3D calibration panel, per-refresh-rate profiles.
+**Black Crush Tweak** - Corrects HDR/SDR near-black by applying a custom gamma ramp (Reinhard shadow curve) restoring shadow detail. Includes a live Direct3D HDR/SDR calibration panel, per-refresh-rate profiles.
 
-**Taskbar Dimmer** — Places a dark semi-transparent overlay on the taskbar to reduce static brightness. Fades out on hover. Automatically hides when a fullscreen app is active, the taskbar is set to auto-hide. Dim level and fade timings are adjustable.
+**Taskbar Dimmer** - Places a dark semi-transparent overlay on the taskbar to reduce static brightness. Fades out on hover. Automatically hides when a fullscreen app is active, the taskbar is set to auto-hide. Dim level and fade timings are adjustable.
 
-**Hotkeys** — Global hotkeys to toggle/adjust features.
+**Settings** - Adjust various Windows settings like power/screensaver options.
+
+**Hotkeys** - Global hotkeys to toggle/adjust features.
 
 ---
 
