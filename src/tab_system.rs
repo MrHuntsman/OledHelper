@@ -10,7 +10,6 @@ use windows::{
         System::{
             Power::*,
             Registry::*,
-            SystemInformation::GetTickCount64,
         },
         UI::{
             Controls::*,
@@ -21,82 +20,17 @@ use windows::{
 };
 
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 
 use crate::{
-    constants::{SS_BLACKRECT, SS_NOPREFIX, IDC_SYS_BTN_TASKBAR_AUTOHIDE,
-                IDC_SYS_DDL_CURSOR_HIDE, TIMER_CURSOR_HIDE},
+    constants::{SS_BLACKRECT, SS_NOPREFIX, IDC_SYS_BTN_TASKBAR_AUTOHIDE},
     controls::ControlBuilder,
     ui_drawing::{combo_subclass_proc, make_font_cached, DefSubclassProc, SetWindowSubclass},
     win32::ControlGroup,
 };
 
 
-// ── Cursor-hide idle tracking ─────────────────────────────────────────────────
-//
-// The WH_MOUSE_LL hook proc (hotkeys.rs) writes to this on every WM_MOUSEMOVE.
-// TIMER_CURSOR_HIDE reads it; no lock needed — single UI thread reads, hook
-// thread writes.  Relaxed ordering is fine: we only care about the value being
-// "recent enough", not about happens-before with any other memory.
-//
-// Stored as milliseconds from GetTickCount64 (wraps every ~49 days; the delta
-// comparison is safe across the wrap because we use wrapping subtraction).
-// CURSOR_LAST_MOVE_MS / cursor_touch() are the primary idle-detection mechanism.
-// Using mouse-movement time (not GetLastInputInfo) means keyboard and click
-// activity do not reset the hide clock — the cursor stays hidden while typing.
-pub static CURSOR_LAST_MOVE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Set to true by on_cursor_hide_tick when cursors are blanked.
-/// Read by the WH_MOUSE_LL hook proc to restore immediately on movement
-/// without waiting for the next 1-second timer tick.
-pub static CURSOR_HIDDEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Set to true when cursor-hide is armed (cursor_hide_idx > 0).
-/// Read by hotkeys.rs to keep the WH_MOUSE_LL hook alive even when no mouse
-/// hotkeys are configured — the hook is the only thing that calls cursor_touch()
-/// on WM_MOUSEMOVE, which resets the idle clock after the cursor is restored.
-/// Without this, CURSOR_LAST_MOVE_MS never updates and the 1-second timer
-/// re-hides the cursor almost immediately after every mouse movement.
-pub static CURSOR_HIDE_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Call from the LL mouse hook proc on every WM_MOUSEMOVE (and optionally
-/// WM_LBUTTONDOWN etc. if you want clicks to also reset the idle clock).
-#[inline(always)]
-pub fn cursor_touch() {
-    CURSOR_LAST_MOVE_MS.store(
-        unsafe { GetTickCount64() },
-        Ordering::Relaxed,
-    );
-}
-
-/// Create a 1×1 fully-transparent cursor at runtime.
-/// The system takes ownership of the HCURSOR returned by SetSystemCursor, so
-/// we must hand it a *fresh* copy each time — never re-use the same handle.
-unsafe fn make_blank_cursor() -> HCURSOR {
-    // AND mask all 1s (transparent), XOR mask all 0s (no colour) → invisible.
-    let and_mask = [0xFFu8; 4]; // 1×1 at 1 bpp = 1 byte; pad to DWORD
-    let xor_mask = [0x00u8; 4];
-    CreateCursor(
-        None,          // not tied to any module
-        0, 0,          // hotspot
-        1, 1,          // 1×1
-        and_mask.as_ptr() as _,
-        xor_mask.as_ptr() as _,
-    ).unwrap_or_default()
-}
-
-/// Restore all system cursors from the current Windows theme/registry.
-/// Safe to call even if the cursor was never hidden.
-pub unsafe fn restore_system_cursors() {
-    windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
-        windows::Win32::UI::WindowsAndMessaging::SPI_SETCURSORS,
-        0,
-        None,
-        windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-    ).ok();
-}
 
 
 //
@@ -192,25 +126,6 @@ pub const TIMEOUT_OPTIONS: &[(&str, u32)] = &[
     ("4 hours",    14400),
     ("5 hours",    18000),
 ];
-
-/// `(label, seconds)` pairs for the cursor-hide dropdown.
-/// Index 0 = "Never" (feature disabled — timer not armed).
-pub const CURSOR_HIDE_OPTIONS: &[(&str, u32)] = &[
-    ("Never",      0),
-    ("5 seconds",  5),
-    ("15 seconds", 15),
-    ("30 seconds", 30),
-    ("1 minute",   60),
-    ("2 minutes",  120),
-    ("5 minutes",  300),
-];
-
-pub fn cursor_hide_to_index(seconds: u32) -> usize {
-    CURSOR_HIDE_OPTIONS
-        .iter()
-        .position(|&(_, s)| s == seconds)
-        .unwrap_or(0)
-}
 
 /// Returns the index into `TIMEOUT_OPTIONS` whose seconds value is the
 /// closest match to `seconds`, or 0 ("Never") if nothing matches.
@@ -552,11 +467,6 @@ pub struct SystemTab {
     pub h_edt_ss_timeout:        HWND,
     pub h_spin_ss:               HWND,
     pub h_lbl_ss_minutes:        HWND,
-    // ── Mouse section ─────────────────────────────────────────────────────────
-    pub h_lbl_sect_mouse:        HWND,
-    pub h_sep_mouse:             HWND,
-    pub h_lbl_cursor_hide:       HWND,
-    pub h_ddl_cursor_hide:       HWND,
     // ─────────────────────────────────────────────────────────────────────────
     pub group:                ControlGroup,
     pub screen_timeout_idx:   usize,
@@ -565,11 +475,6 @@ pub struct SystemTab {
     pub screensaver_idx:      usize,
     /// (display_name, exe_path); index 0 is always ("(None)", "").
     pub screensavers:         Vec<(String, String)>,
-    /// Index into CURSOR_HIDE_OPTIONS (0 = Never / disabled).
-    pub cursor_hide_idx:      usize,
-    /// True while the cursor is currently hidden via SetSystemCursor.
-    /// Used to avoid redundant API calls on every timer tick.
-    pub cursor_hidden:        bool,
     /// Guard: set while we programmatically update the edit text to suppress
     /// the resulting EN_CHANGE from re-entering. (Kept for future use if EN_CHANGE returns.)
     pub suppress_en_change:   bool,
@@ -763,34 +668,6 @@ impl SystemTab {
         windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h_edt_ss_timeout, ss_enabled);
         windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h_spin_ss,        ss_enabled);
 
-        // ── Mouse section ─────────────────────────────────────────────────────
-        let h_lbl_sect_mouse = cb.static_text(w!("Mouse"), SS_NOPREFIX);
-        SendMessageW(h_lbl_sect_mouse, WM_SETFONT,
-            WPARAM(font_sect.0 as usize), LPARAM(1));
-
-        let h_sep_mouse       = cb.static_text(w!(""), SS_BLACKRECT);
-        let h_lbl_cursor_hide = cb.static_text(w!("Hide cursor on inactivity"), SS_NOPREFIX);
-
-        let h_ddl_cursor_hide = CreateWindowExW(
-            WINDOW_EX_STYLE(0), w!("COMBOBOX"), PCWSTR::null(),
-            ddl_style, 0, 0, 0, 0,
-            parent, HMENU(IDC_SYS_DDL_CURSOR_HIDE as _), hinstance, None,
-        ).unwrap_or_default();
-        SendMessageW(h_ddl_cursor_hide, WM_SETFONT,
-            WPARAM(font_normal.0 as usize), LPARAM(1));
-        SetWindowSubclass(h_ddl_cursor_hide, Some(combo_subclass_proc), 1, 0);
-        SendMessageW(h_ddl_cursor_hide, CB_SETITEMHEIGHT, WPARAM(usize::MAX), LPARAM(item_h));
-        SendMessageW(h_ddl_cursor_hide, CB_SETITEMHEIGHT, WPARAM(0),          LPARAM(item_h));
-
-        for &(label, _) in CURSOR_HIDE_OPTIONS {
-            let lw: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            SendMessageW(h_ddl_cursor_hide, CB_ADDSTRING, WPARAM(0),
-                LPARAM(lw.as_ptr() as isize));
-        }
-        // Default to "Never" (index 0) — overridden by INI load in app.rs.
-        let cursor_hide_idx = 0usize;
-        SendMessageW(h_ddl_cursor_hide, CB_SETCURSEL, WPARAM(cursor_hide_idx), LPARAM(0));
-
         let group = ControlGroup::new(vec![
             h_lbl_title,
             h_lbl_desc,
@@ -802,8 +679,6 @@ impl SystemTab {
             h_lbl_sect_screensaver, h_sep_screensaver,
             h_lbl_screensaver, h_ddl_screensaver,
             h_lbl_ss_timeout, h_edt_ss_timeout, h_spin_ss, h_lbl_ss_minutes,
-            h_lbl_sect_mouse, h_sep_mouse,
-            h_lbl_cursor_hide, h_ddl_cursor_hide,
         ]);
         group.set_visible(false);
 
@@ -819,15 +694,11 @@ impl SystemTab {
             h_lbl_sect_screensaver, h_sep_screensaver,
             h_lbl_screensaver, h_ddl_screensaver,
             h_lbl_ss_timeout, h_edt_ss_timeout, h_spin_ss, h_lbl_ss_minutes,
-            h_lbl_sect_mouse, h_sep_mouse,
-            h_lbl_cursor_hide, h_ddl_cursor_hide,
             group,
             screen_timeout_idx,
             sleep_timeout_idx,
             screensaver_idx,
             screensavers,
-            cursor_hide_idx,
-            cursor_hidden: false,
             suppress_en_change: false,
         }
     }
@@ -1005,104 +876,6 @@ impl SystemTab {
         unsafe { SetWindowTextW(hwnd, PCWSTR(text.as_ptr())); }
     }
 
-    /// Called from WM_COMMAND when `IDC_SYS_DDL_CURSOR_HIDE` fires CBN_SELCHANGE.
-    /// Arms or kills TIMER_CURSOR_HIDE, saves the new index, and resets the idle
-    /// clock so the cursor isn't hidden immediately after the user interacts with
-    /// the dropdown.
-    pub unsafe fn on_cursor_hide_changed(&mut self, hwnd: HWND) -> &'static str {
-        let sel = SendMessageW(self.h_ddl_cursor_hide,
-            CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-        let sel = sel.min(CURSOR_HIDE_OPTIONS.len() - 1);
-        self.cursor_hide_idx = sel;
-
-        // Reset idle clock so the timer doesn't immediately fire.
-        cursor_touch();
-
-        if sel == 0 {
-            // "Never" — disarm timer and ensure cursor is visible.
-            CURSOR_HIDE_ENABLED.store(false, Ordering::Relaxed);
-            KillTimer(hwnd, TIMER_CURSOR_HIDE);
-            restore_system_cursors();
-            "Cursor hide: disabled"
-        } else {
-            // Arm a 1-second tick; cheap — fires ~once/sec, one atomic read per tick.
-            CURSOR_HIDE_ENABLED.store(true, Ordering::Relaxed);
-            SetTimer(hwnd, TIMER_CURSOR_HIDE, 1000, None);
-            "Cursor hide: enabled"
-        }
-    }
-
-    /// Called from WM_TIMER for `TIMER_CURSOR_HIDE` (~1 s tick).
-    ///
-    /// Uses `CURSOR_LAST_MOVE_MS` (written by the WH_MOUSE_LL hook on every
-    /// WM_MOUSEMOVE) to measure mouse-only idle time.  Keyboard and click
-    /// activity intentionally do NOT reset the clock — the cursor should stay
-    /// hidden while the user is typing or clicking without moving the mouse.
-    /// One cheap atomic read per tick; only calls SetSystemCursor /
-    /// restore_system_cursors on state change.
-    pub unsafe fn on_cursor_hide_tick(&mut self, hwnd: HWND) {
-        let threshold_secs = match CURSOR_HIDE_OPTIONS.get(self.cursor_hide_idx) {
-            Some(&(_, s)) if s > 0 => s as u64,
-            _ => {
-                KillTimer(hwnd, TIMER_CURSOR_HIDE);
-                return;
-            }
-        };
-
-        // Sync local state from the hook atomic — the LL mouse hook restores
-        // the cursor immediately on WM_MOUSEMOVE and clears CURSOR_HIDDEN.
-        // The timer only needs to handle hiding; the hook handles showing.
-        // We still check here so self.cursor_hidden stays consistent.
-        let currently_hidden = CURSOR_HIDDEN.load(Ordering::Relaxed);
-        if self.cursor_hidden && !currently_hidden {
-            // Hook already restored — just sync and return. The timer stays at
-            // 1s throughout; no fast-tick mode needed since the hook is instant.
-            self.cursor_hidden = false;
-            return;
-        }
-
-        // Only consider hiding if not already hidden.
-        if self.cursor_hidden { return; }
-
-        // Read the timestamp of the last mouse movement written by the LL hook.
-        // If the mouse has never moved since startup (u64::MAX), saturating_sub
-        // gives idle_ms = 0 so the cursor stays visible until the first move.
-        let now_ms  = GetTickCount64();
-        let last_ms = CURSOR_LAST_MOVE_MS.load(Ordering::Relaxed);
-        let idle_ms = now_ms.saturating_sub(last_ms);
-
-        if idle_ms >= threshold_secs * 1000 {
-            self.cursor_hidden = true;
-            CURSOR_HIDDEN.store(true, Ordering::Relaxed);
-            // Replace ALL standard cursors so nothing leaks through.
-            // SetSystemCursor takes ownership — fresh handle required each call.
-            for &id in &[
-                32512u32, // OCR_NORMAL  — arrow
-                32513,    // OCR_IBEAM   — text beam
-                32514,    // OCR_WAIT    — hourglass
-                32515,    // OCR_CROSS
-                32516,    // OCR_UP
-                32642,    // OCR_SIZENWSE
-                32643,    // OCR_SIZENESW
-                32644,    // OCR_SIZEWE
-                32645,    // OCR_SIZENS
-                32646,    // OCR_SIZEALL
-                32648,    // OCR_NO
-                32649,    // OCR_HAND
-                32650,    // OCR_APPSTARTING
-            ] {
-                let blank = make_blank_cursor();
-                if !blank.is_invalid() {
-                    SetSystemCursor(blank, SYSTEM_CURSOR_ID(id));
-                }
-            }
-        }
-    }
-
-    /// Expose whether the cursor is currently hidden (used by app.rs on exit /
-    /// tab-switch to guarantee restoration).
-    pub fn cursor_is_hidden(&self) -> bool {
-        CURSOR_HIDDEN.load(Ordering::Relaxed)
-    }
+    // (cursor-hide methods removed)
 
 }

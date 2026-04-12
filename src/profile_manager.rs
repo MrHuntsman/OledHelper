@@ -92,7 +92,7 @@ impl ProfileManager {
         self.flush();
     }
 
-    /// Returns all section names in insertion order.
+    /// Returns all section names in insertion order (in-memory order).
     pub fn get_sections(&self) -> Vec<String> {
         self.sections.iter().map(|s| s.name.clone()).collect()
     }
@@ -137,7 +137,7 @@ impl ProfileManager {
 
     fn flush(&self) {
         if let Ok(mut f) = fs::File::create(&self.path) {
-            for section in &self.sections {
+            for section in self.sorted_sections() {
                 let _ = writeln!(f, "[{}]", section.name);
                 for (k, v) in &section.entries {
                     let _ = writeln!(f, "{}={}", k, v);
@@ -145,6 +145,52 @@ impl ProfileManager {
                 let _ = writeln!(f);
             }
         }
+    }
+
+    /// Returns references to sections in a stable, human-readable order:
+    ///
+    ///   1. `[_state]`           — global app flags
+    ///   2. `[hz_*]` sections    — Hz profiles, sorted numerically descending (highest Hz first) by the
+    ///                             integer that follows the `hz_` prefix
+    ///   3. `[Hotkeys]`          — keyboard / mouse bindings
+    ///   4. `[Mouse]`            — cursor-hide setting
+    ///   5. Everything else      — in original insertion order
+    ///
+    /// Comparison is case-insensitive so capitalisation differences in the INI
+    /// file do not break the ordering.
+    fn sorted_sections(&self) -> Vec<&Section> {
+        // Build sort keys up-front into an owned Vec so sort_by_key never
+        // holds a borrow into the sections slice while sorting.
+        //
+        // Key layout: (tier, hz, original_index)
+        //   tier 0 = [_state]
+        //   tier 1 = [hz_*]  sorted numerically
+        //   tier 2 = [Hotkeys]
+        //   tier 3 = [Mouse]
+        //   tier 4 = everything else, original order preserved
+        let keys: Vec<(u8, i32, usize)> = self.sections
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let lower = s.name.to_ascii_lowercase();
+                if lower == "_state" {
+                    (0u8, 0i32, idx)
+                } else if let Some(rest) = lower.strip_prefix("hz_") {
+                    let hz = rest.parse::<i32>().unwrap_or(i32::MAX);
+                    (1u8, -hz, idx)
+                } else if lower == "hotkeys" {
+                    (2u8, 0i32, idx)
+                } else if lower == "mouse" {
+                    (3u8, 0i32, idx)
+                } else {
+                    (4u8, 0i32, idx)
+                }
+            })
+            .collect();
+
+        let mut order: Vec<usize> = (0..self.sections.len()).collect();
+        order.sort_by_key(|&i| keys[i]);
+        order.iter().map(|&i| &self.sections[i]).collect()
     }
 }
 

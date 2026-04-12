@@ -109,8 +109,8 @@ pub struct AppState {
 
     // ── Shared controls ───────────────────────────────────────────────────────
     pub h_chk_startup:    HWND,
-    pub h_btn_quit:       HWND,
-    pub h_btn_minimize:   HWND,
+    #[allow(dead_code)] pub h_btn_quit:       HWND,
+    #[allow(dead_code)] pub h_btn_minimize:   HWND,
     pub h_btn_hdr_toggle: HWND,
     pub h_lbl_status:     HWND,
     /// Persistent error label shown below h_lbl_status (gamma blocked, etc.).
@@ -141,6 +141,8 @@ pub struct AppState {
 
     tray_menu:   HMENU,
     tray_added:  bool,
+    /// Set to true after the first close-to-tray balloon has been shown once.
+    tray_balloon_shown: bool,
 
     ini:               ProfileManager,
     status_color:      COLORREF,
@@ -231,7 +233,6 @@ impl AppState {
             self.about.h_lbl_sect_update,
             self.system.h_lbl_sect_power,
             self.system.h_lbl_sect_screensaver,
-            self.system.h_lbl_sect_mouse,
         ] {
             SendMessageW(h, WM_SETFONT, WPARAM(font_sect.0 as usize), LPARAM(1));
         }
@@ -783,9 +784,6 @@ unsafe extern "system" fn wnd_proc(
                             apply_ramp(st, hwnd);
                         }
                     }
-                    TIMER_CURSOR_HIDE => {
-                        st.system.on_cursor_hide_tick(hwnd);
-                    }
                     _ => {}
                 }
             }
@@ -859,7 +857,6 @@ unsafe extern "system" fn wnd_proc(
                     || di.hwndItem == st.system.h_ddl_screen_timeout
                     || di.hwndItem == st.system.h_ddl_sleep_timeout
                     || di.hwndItem == st.system.h_ddl_screensaver
-                    || di.hwndItem == st.system.h_ddl_cursor_hide
                 {
                     ui_drawing::draw_combo_item(di);
                 } else if di.hwndItem == st.h_nav_btn[0] {
@@ -1087,7 +1084,7 @@ unsafe extern "system" fn wnd_proc(
 
         WM_DOWNLOAD_DONE => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
-                st.about.on_download_done(hwnd, wparam.0 == 1);
+                st.about.on_download_done(hwnd, wparam.0, lparam.0);
             }
             LRESULT(0)
         }
@@ -1288,6 +1285,11 @@ unsafe extern "system" fn wnd_proc(
         WM_CLOSE => {
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 st.crush.hdr_panel.suspend_d3d();
+                if !st.tray_balloon_shown {
+                    st.tray_balloon_shown = true;
+                    st.ini.write("App", "TrayBalloonShown", "1");
+                    tray::show_tray_balloon(hwnd);
+                }
             }
             ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
@@ -1309,11 +1311,6 @@ unsafe extern "system" fn wnd_proc(
                 KillTimer(hwnd, TIMER_STATUS_CLEAR);
                 KillTimer(hwnd, TIMER_FULLSCREEN_RECHECK);
                 KillTimer(hwnd, TIMER_RAMP_APPLY);
-                KillTimer(hwnd, TIMER_CURSOR_HIDE);
-                // Restore system cursors if they were hidden at exit time.
-                if st.system.cursor_is_hidden() {
-                    crate::tab_system::restore_system_cursors();
-                }
                 WTSUnRegisterSessionNotification(hwnd);
                 gamma_ramp::reset_display_ramp();
                 crate::tab_debug::uninstall_mouse_hook();
@@ -1348,7 +1345,6 @@ unsafe extern "system" fn wnd_proc(
                 // Arm a one-shot recheck ~1 s from now to catch games that resize
                 // *after* EVENT_SYSTEM_FOREGROUND fires (late-sizing).  This
                 // replaces the old continuous 500 ms polling of is_fullscreen_on_monitor
-                // inside tick_fade.
                 SetTimer(hwnd, TIMER_FULLSCREEN_RECHECK, 1000, None);
             }
             LRESULT(0)
@@ -1434,23 +1430,10 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
-        // Restore hidden cursor instantly on any mouse activity — WM_SETCURSOR
-        // fires on the UI thread the moment the cursor moves over any window,
-        // so this covers the whole screen without needing a hook.
-        // The atomic check costs ~1 cycle when the cursor is already visible.
+        // Restore hidden cursor when it moves over THIS window.
+        // WM_SETCURSOR is sent to the window under the pointer, so this handler
+        // only fires when the cursor is over OledHelper.
         WM_SETCURSOR => {
-            if crate::tab_system::CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::tab_system::CURSOR_HIDDEN.store(false, std::sync::atomic::Ordering::Relaxed);
-                // Reset the idle clock so the 1-second timer doesn't immediately
-                // re-hide the cursor on the next tick.  Without this, CURSOR_LAST_MOVE_MS
-                // still holds the old stale timestamp and idle_ms stays above the
-                // threshold, causing the cursor to vanish again almost instantly.
-                crate::tab_system::cursor_touch();
-                if let Some(st) = borrow_state::<AppState>(hwnd) {
-                    st.system.cursor_hidden = false;
-                    crate::tab_system::restore_system_cursors();
-                }
-            }
             // Show a hand cursor when hovering over the GitHub link label.
             let cursor_hwnd = HWND(wparam.0 as *mut _);
             if let Some(st) = borrow_state::<AppState>(hwnd) {
@@ -1575,21 +1558,6 @@ let hotkeys = HotkeysTab::new(
     let mut system = SystemTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
     SetWindowSubclass(system.h_btn_taskbar_autohide, Some(hdr_toggle_subclass_proc), 5, 0);
 
-    // ── Restore cursor-hide setting from INI ──────────────────────────────────
-    // Initialise the idle clock immediately so the first timer tick doesn't fire
-    // at t=0 (which would be 49 days of idle on a freshly booted machine).
-    crate::tab_system::cursor_touch();
-    {
-        let secs: u32 = ini.read("Mouse", "CursorHideSeconds", "0")
-            .parse().unwrap_or(0);
-        let idx = crate::tab_system::cursor_hide_to_index(secs);
-        system.cursor_hide_idx = idx;
-        SendMessageW(system.h_ddl_cursor_hide, CB_SETCURSEL, WPARAM(idx), LPARAM(0));
-        // Sync the enabled flag so register_hotkeys (called below) knows to keep
-        // the WH_MOUSE_LL hook alive for idle-clock updates even with no mouse hotkeys.
-        crate::tab_system::CURSOR_HIDE_ENABLED.store(idx > 0, std::sync::atomic::Ordering::Relaxed);
-        // Timer is armed below after state is fully built.
-    }
     let about = AboutTab::new(hwnd, hinstance, dpi, _font_normal, _font_title);
 
     // ── Hover tracking for owner-drawn buttons/checkboxes ─────────────────────
@@ -1611,6 +1579,7 @@ let hotkeys = HotkeysTab::new(
         bg_brush, bg3_brush, sep_brush,
         _font_normal, _font_title, _font_bold_val,
         tray_menu, tray_added: false,
+        tray_balloon_shown: ini.read("App", "TrayBalloonShown", "0") == "1",
         ini,
         status_color: C_ACCENT,
         chk_startup_state: false,
@@ -1670,11 +1639,6 @@ let hotkeys = HotkeysTab::new(
 
     tray::add_tray_icon(hwnd, hinstance, &mut state.tray_added);
     register_hotkeys(&state.ini, &mut state.mouse_hotkeys, hwnd);
-
-    // Arm the cursor-hide timer if the persisted setting is active.
-    if state.system.cursor_hide_idx > 0 {
-        SetTimer(hwnd, TIMER_CURSOR_HIDE, 1000, None);
-    }
 
     state
 }
@@ -1754,6 +1718,17 @@ unsafe fn show_tab(st: &mut AppState, hwnd: HWND) {
     st.hotkeys.group.set_visible(tab == 3);
     st.debug.group.set_visible(tab == 4);
     st.about.group.set_visible(tab == 5);
+    // h_btn_update and h_lbl_dl_status are not in the group (so they are never
+    // auto-shown), but we must explicitly hide them when leaving the About tab
+    // so they don't bleed over other tabs' content.
+    if tab != 5 {
+        ShowWindow(st.about.h_btn_update,    SW_HIDE);
+        ShowWindow(st.about.h_lbl_dl_status, SW_HIDE);
+    } else if st.update_available {
+        // Restore them when returning to About, but only if an update exists.
+        ShowWindow(st.about.h_btn_update, SW_SHOW);
+        // h_lbl_dl_status stays hidden unless a download is in progress.
+    }
     // Re-layout when switching to About so changelog is positioned if update arrived
     // while a different tab was active.
     if tab == 5 {
@@ -1854,16 +1829,6 @@ unsafe fn on_command(st: &mut AppState, hwnd: HWND, id: usize, notify: u32, _ctr
         IDC_SYS_DDL_SCREENSAVER if notify == CBN_SELCHANGE as u32 => {
             let msg = st.system.on_screensaver_changed();
             set_status(st, &msg, C_ACCENT);
-        }
-        IDC_SYS_DDL_CURSOR_HIDE if notify == CBN_SELCHANGE as u32 => {
-            let msg = st.system.on_cursor_hide_changed(hwnd);
-            // Persist the new index to INI.
-            let secs = crate::tab_system::CURSOR_HIDE_OPTIONS
-                .get(st.system.cursor_hide_idx)
-                .map(|&(_, s)| s)
-                .unwrap_or(0);
-            st.ini.write("Mouse", "CursorHideSeconds", &secs.to_string());
-            set_status(st, msg, C_ACCENT);
         }
         IDC_SYS_EDT_SS_TIMEOUT if notify == 0x0200 => { // EN_KILLFOCUS
             let msg = unsafe { st.system.commit_ss_timeout() };

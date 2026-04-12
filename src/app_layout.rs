@@ -144,10 +144,10 @@ impl LayoutGrid {
         let tog2_y = tog1_y + tog_h + tog_gap;
         self.set(st.h_chk_startup,    self.s(12), tog1_y, col_w, tog_h);
         self.set(st.h_btn_hdr_toggle, self.s(12), tog2_y, col_w, tog_h);
-        let quit_y = self.ch - self.s(14) - self.s(24);
-        let foot_hw = col_w / 2 - self.s(2);
-        self.set(st.h_btn_minimize, self.s(12), quit_y, foot_hw, self.s(24));
-        self.set(st.h_btn_quit,     self.s(12) + foot_hw + self.s(4), quit_y, foot_hw, self.s(24));
+        // let quit_y = self.ch - self.s(14) - self.s(24);
+        // let foot_hw = col_w / 2 - self.s(2);
+        // self.set(st.h_btn_minimize, self.s(12), quit_y, foot_hw, self.s(24));
+        // self.set(st.h_btn_quit,     self.s(12) + foot_hw + self.s(4), quit_y, foot_hw, self.s(24));
     }
 
     fn place_black_crush_tab(&mut self, st: &mut crate::app::AppState, _hwnd: HWND) -> i32 {
@@ -353,16 +353,6 @@ impl LayoutGrid {
         self.set(st.system.h_edt_ss_timeout, pw_ddl_x,    y, ss_edit_w, self.s(22));
         self.set(st.system.h_spin_ss,        ss_spin_x,   y, ss_spin_w, self.s(22));
         self.set(st.system.h_lbl_ss_minutes, ss_mins_x,   y, ss_mins_w, pw_row_h);
-        y += pw_row_h + self.s(14);
-
-        // ── "Mouse" section ───────────────────────────────────────────────────
-        self.place_with_gap(&mut y, self.main_x, self.main_w, self.s(20),
-            st.system.h_lbl_sect_mouse, self.s(4));
-        self.place_separator(&mut y, self.main_x, self.main_w,
-            st.system.h_sep_mouse);
-
-        self.set(st.system.h_lbl_cursor_hide, self.main_x, y, pw_lbl_w,  pw_row_h);
-        self.set(st.system.h_ddl_cursor_hide, pw_ddl_x,    y, pw_ddl_w,  pw_row_h + self.s(120));
         // y not advanced — last row in this tab
     }
 

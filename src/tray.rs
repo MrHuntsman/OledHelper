@@ -7,7 +7,13 @@ use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND},
         UI::{
-            Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW},
+            Shell::{
+                Shell_NotifyIconW,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
+                NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NIIF_INFO,
+                NOTIFYICONDATAW,
+            },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu,
                 LoadIconW, IDI_APPLICATION,
@@ -55,6 +61,33 @@ pub unsafe fn add_tray_icon(hwnd: HWND, hinstance: HINSTANCE, tray_added: &mut b
     nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
     Shell_NotifyIconW(NIM_ADD, &nid);
     *tray_added = true;
+}
+
+/// Show a balloon notification on the tray icon informing the user the app
+/// minimized to tray.  Safe to call only after `add_tray_icon` has succeeded.
+#[allow(unused_must_use)]
+pub unsafe fn show_tray_balloon(hwnd: HWND) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd:   hwnd,
+        uID:    1,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+
+    let title: Vec<u16> = "Oled Helper\0".encode_utf16().collect();
+    let msg:   Vec<u16> = "Oled Helper is still running in the system tray.\0"
+        .encode_utf16().collect();
+
+    let t_len = title.len().min(63);
+    let m_len = msg.len().min(255);
+    nid.szInfoTitle[..t_len].copy_from_slice(&title[..t_len]);
+    nid.szInfo[..m_len].copy_from_slice(&msg[..m_len]);
+    // uTimeout is ignored on Vista+ but set it anyway for XP compat.
+    nid.Anonymous.uTimeout = 3000;
+
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 /// Remove the tray icon (if present) and destroy the popup menu.

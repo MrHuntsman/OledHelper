@@ -56,6 +56,18 @@ fn ini_path() -> PathBuf {
     dir
 }
 
+/// Strips the `\\?\` extended-length path prefix added by `current_exe()` on
+/// Windows.  `std::process::Command` (CreateProcess) does not accept `\\?\`
+/// paths, so the prefix must be removed before spawning a child process.
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
 fn main() {
     unsafe { run_app(); }
 }
@@ -137,7 +149,9 @@ unsafe fn run_app() {
 
     if should_restart {
         // Tray "Restart" — relaunch the current exe.
+        // current_exe() returns a \\?\ path on Windows; strip it so CreateProcess works.
         if let Ok(exe) = std::env::current_exe() {
+            let exe = strip_unc_prefix(exe);
             let _ = std::process::Command::new(exe).spawn();
         }
     } else if let Some(path) = update_path {

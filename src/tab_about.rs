@@ -141,7 +141,9 @@ impl AboutTab {
             h_lbl_link,
             h_lbl_sect_update, h_sep_update,
             h_lbl_check_info,
-            h_btn_update, h_lbl_dl_status,
+            // h_btn_update and h_lbl_dl_status are intentionally excluded from
+            // the group so that group.set_visible(true) never auto-shows them.
+            // They are shown manually in on_update_result (wparam == 1 only).
             h_lbl_sect_changelog, h_sep_changelog,
             h_lbl_changelog,
         ]);
@@ -267,11 +269,13 @@ impl AboutTab {
 
         let hwnd_raw = hwnd.0 as usize;
         std::thread::spawn(move || {
-            let result = download_update(hwnd_raw);
-            let wp = if result { 1usize } else { 0 };
+            let (wp, lp): (usize, isize) = match download_update(hwnd_raw) {
+                Ok(())   => (1, 0),
+                Err(msg) => (0, Box::into_raw(Box::new(msg)) as isize),
+            };
             unsafe {
                 let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-                PostMessageW(hwnd, WM_DOWNLOAD_DONE, WPARAM(wp), LPARAM(0));
+                PostMessageW(hwnd, WM_DOWNLOAD_DONE, WPARAM(wp), LPARAM(lp));
             }
         });
     }
@@ -288,10 +292,16 @@ impl AboutTab {
     }
 
     /// Called from WndProc on `WM_DOWNLOAD_DONE`.
-    /// On success: rename files and relaunch. On failure: re-enable button.
-    pub unsafe fn on_download_done(&mut self, hwnd: HWND, success: bool) {
-        if !success {
-            let msg: Vec<u16> = "Download failed. Try again.".encode_utf16().collect();
+    /// wparam = 1 success, 0 failure; on failure lparam = Box<String> error pointer (caller frees).
+    /// On success: rename files and relaunch. On failure: show error and re-enable button.
+    pub unsafe fn on_download_done(&mut self, hwnd: HWND, wparam: usize, lparam: isize) {
+        if wparam == 0 {
+            let reason = if lparam != 0 {
+                *Box::from_raw(lparam as *mut String)
+            } else {
+                "Download failed.".to_string()
+            };
+            let msg: Vec<u16> = format!("{reason}\0").encode_utf16().collect();
             SetWindowTextW(self.h_lbl_dl_status, PCWSTR(msg.as_ptr()));
             EnableWindow(self.h_btn_update, true);
             return;
@@ -381,11 +391,93 @@ fn check_github_release() -> StdResult<Option<ReleaseInfo>, ()> {
     let tag_clean = tag.trim_start_matches('v');
     let cur_clean = APP_VERSION.trim_start_matches('v');
 
-    if tag_clean != cur_clean {
+    let remote = match SemVer::parse(tag_clean) {
+        Some(v) => v,
+        None    => return Ok(None), // unparseable tag — ignore
+    };
+    let current = match SemVer::parse(cur_clean) {
+        Some(v) => v,
+        None    => return Ok(None),
+    };
+
+    // Skip pre-release tags (alpha/beta/rc) unless this build is itself a
+    // pre-release — stable users should only be offered stable releases.
+    if remote.pre.is_some() && current.pre.is_none() {
+        return Ok(None);
+    }
+
+    if remote > current {
         let body = extract_json_string(json, "body").unwrap_or_default();
         Ok(Some(ReleaseInfo { tag, body }))
     } else {
         Ok(None)
+    }
+}
+
+// ── Minimal semver parser ─────────────────────────────────────────────────────
+// Handles MAJOR.MINOR.PATCH and MAJOR.MINOR.PATCH-pre (e.g. -alpha.1, -beta.2,
+// -rc.3).  No external crate needed.
+
+#[derive(Eq, PartialEq)]
+struct SemVer {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    /// Raw pre-release string, e.g. "alpha.1", "beta.2", "rc.3". None = stable.
+    pre: Option<String>,
+}
+
+impl SemVer {
+    fn parse(s: &str) -> Option<Self> {
+        let (core, pre) = match s.find('-') {
+            Some(i) => (&s[..i], Some(s[i + 1..].to_string())),
+            None    => (s, None),
+        };
+        let mut parts = core.splitn(3, '.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some(Self { major, minor, patch, pre })
+    }
+
+    /// Decomposes a pre-release string into (identifier_rank, numeric_suffix).
+    /// e.g. "beta"   → (2, 0)
+    ///      "beta.0" → (2, 0)
+    ///      "beta.1" → (2, 1)
+    ///      "rc.3"   → (3, 3)
+    ///      stable   → (4, 0)
+    fn pre_rank(pre: &Option<String>) -> (u8, u32) {
+        let s = match pre.as_deref() {
+            None    => return (4, 0), // stable
+            Some(s) => s,
+        };
+        let (label, num) = match s.find('.') {
+            Some(i) => (&s[..i], s[i + 1..].parse::<u32>().unwrap_or(0)),
+            None    => (s, 0), // bare "beta" / "rc" treated as .0
+        };
+        let rank = match label {
+            "rc"    => 3,
+            "beta"  => 2,
+            "alpha" => 1,
+            _       => 0,
+        };
+        (rank, num)
+    }
+}
+
+impl Ord for SemVer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::Equal;
+        let c = self.major.cmp(&other.major); if c != Equal { return c; }
+        let c = self.minor.cmp(&other.minor); if c != Equal { return c; }
+        let c = self.patch.cmp(&other.patch); if c != Equal { return c; }
+        Self::pre_rank(&self.pre).cmp(&Self::pre_rank(&other.pre))
+    }
+}
+
+impl PartialOrd for SemVer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -433,8 +525,8 @@ unsafe fn shell_open(url: &str) {
 // ── Self-update: download + rename swap ──────────────────────────────────────
 
 /// Downloads the latest `OledHelper.exe` asset into `<exe_dir>/OledHelper_update.exe`.
-/// Posts `WM_DOWNLOAD_PROGRESS` on each chunk. Returns true on success.
-fn download_update(hwnd_raw: usize) -> bool {
+/// Posts `WM_DOWNLOAD_PROGRESS` on each chunk. Returns `Ok(())` on success, `Err(msg)` on failure.
+fn download_update(hwnd_raw: usize) -> std::result::Result<(), String> {
     use std::io::Write;
 
     let url = concat!(
@@ -443,42 +535,44 @@ fn download_update(hwnd_raw: usize) -> bool {
     );
 
     // Destination: same folder as the running exe.
-    let exe_dir = match std::env::current_exe()
+    let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        Some(d) => d,
-        None    => return false,
-    };
+        .ok_or_else(|| "cannot determine exe directory".to_string())?;
     let dest = exe_dir.join("OledHelper_update.exe");
 
     // Remove any leftover partial download.
     let _ = std::fs::remove_file(&dest);
 
-    let resp = match minreq::get(url)
+    let resp = minreq::get(url)
         .with_header("User-Agent", "Oled_Helper")
         .with_timeout(120)
         .send()
-    {
-        Ok(r) if r.status_code == 200 => r,
-        _ => return false,
-    };
+        .map_err(|e| format!("network error: {e}"))?;
+
+    if resp.status_code != 200 {
+        return Err(format!("unexpected HTTP {}", resp.status_code));
+    }
 
     let bytes = resp.as_bytes();
     let total  = bytes.len();
 
-    let mut file = match std::fs::File::create(&dest) {
-        Ok(f)  => f,
-        Err(_) => return false,
-    };
+    // Sanity-check: a valid Windows PE starts with "MZ".
+    // Catches cases where the download returned an HTML error page instead of
+    // the actual binary (e.g. CDN error, wrong asset name).
+    if total < 2 || &bytes[..2] != b"MZ" {
+        return Err(format!("downloaded file is not a valid executable ({total} bytes)"));
+    }
+
+    let mut file = std::fs::File::create(&dest)
+        .map_err(|e| format!("cannot create temp file: {e}"))?;
 
     // Write in 64 KB chunks and report progress.
     const CHUNK: usize = 65536;
     let mut written = 0usize;
     for chunk in bytes.chunks(CHUNK) {
-        if file.write_all(chunk).is_err() {
-            return false;
-        }
+        file.write_all(chunk)
+            .map_err(|e| format!("write error: {e}"))?;
         written += chunk.len();
         unsafe {
             let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut std::ffi::c_void);
@@ -491,7 +585,12 @@ fn download_update(hwnd_raw: usize) -> bool {
         }
     }
 
-    true
+    // Flush kernel buffers to disk before the rename swap.
+    file.flush().map_err(|e| format!("flush error: {e}"))?;
+    file.sync_all().map_err(|e| format!("sync error: {e}"))?;
+    drop(file);
+
+    Ok(())
 }
 
 /// Renames the current exe to `OledHelper_old.exe` and the downloaded
@@ -499,6 +598,12 @@ fn download_update(hwnd_raw: usize) -> bool {
 fn apply_update() -> std::result::Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let current = std::env::current_exe()
         .map_err(|e| e.to_string())?;
+
+    // current_exe() on Windows returns a \\?\ extended-length path.
+    // CreateProcess (used by std::process::Command) does NOT accept \\?\ paths,
+    // so strip the prefix here so the spawned path works correctly.
+    let current = strip_unc_prefix(current);
+
     let dir = current.parent()
         .ok_or_else(|| "cannot determine exe directory".to_string())?;
 
@@ -522,4 +627,16 @@ fn apply_update() -> std::result::Result<(std::path::PathBuf, std::path::PathBuf
         .map_err(|e| format!("cannot rename update: {e}"))?;
 
     Ok((new_exe, old_exe))
+}
+
+/// Strips the `\\?\` extended-length path prefix that `current_exe()` adds on
+/// Windows.  `std::process::Command` (CreateProcess) does not accept `\\?\`
+/// paths, so the prefix must be removed before spawning a child process.
+fn strip_unc_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        path
+    }
 }

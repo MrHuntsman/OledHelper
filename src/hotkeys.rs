@@ -19,7 +19,8 @@ use windows::Win32::{
             CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
             HHOOK, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
             WH_KEYBOARD_LL, WH_MOUSE_LL,
-            WM_HOTKEY, WM_KEYUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_SYSKEYUP, WM_XBUTTONDOWN,
+            WM_HOTKEY, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE,
+            WM_RBUTTONDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
         },
     },
 };
@@ -208,11 +209,10 @@ pub unsafe fn register_hotkeys(
         }
     }
 
-    if any_mouse || crate::tab_system::CURSOR_HIDE_ENABLED.load(Ordering::SeqCst) {
+    if any_mouse {
         ensure_mouse_hook_installed(hwnd);
     } else {
-        // No mouse bindings and cursor-hide is off — uninstall the hook to
-        // avoid unnecessary overhead.
+        // No mouse bindings — uninstall the hook to avoid unnecessary overhead.
         uninstall_mouse_hook();
     }
 }
@@ -327,18 +327,6 @@ unsafe extern "system" fn mouse_ll_hook_proc(
     use crate::tab_hotkeys::{MB_MIDDLE, xbutton_index_to_sentinel};
 
     if code >= 0 {
-        // Reset cursor-hide idle clock on any mouse movement.
-        if wp.0 as u32 == WM_MOUSEMOVE {
-            crate::tab_system::cursor_touch();
-            // Restore cursors immediately on movement — don't wait for the 1s
-            // timer tick. cursor_hidden is checked atomically to avoid calling
-            // SPI_SETCURSORS on every move event when already visible.
-            if crate::tab_system::CURSOR_HIDDEN.load(Ordering::Relaxed) {
-                crate::tab_system::CURSOR_HIDDEN.store(false, Ordering::Relaxed);
-                unsafe { crate::tab_system::restore_system_cursors() };
-            }
-        }
-
         let sentinel: Option<u32> = match wp.0 as u32 {
             WM_MBUTTONDOWN => Some(MB_MIDDLE),
             WM_XBUTTONDOWN => {
