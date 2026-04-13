@@ -33,7 +33,7 @@ extern "system" {
     pub fn DefSubclassProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
 }
 
-// AlphaBlend lives in Msimg32 — link it explicitly.
+// AlphaBlend lives in Msimg32.
 #[link(name = "Msimg32")]
 extern "system" {
     fn AlphaBlend(
@@ -50,10 +50,8 @@ extern "system" {
 use crate::constants::*;
 
 // ── Accent colour ─────────────────────────────────────────────────────────────
-//
-// DwmGetColorizationColor returns the Windows accent colour as 0xAARRGGBB.
-// We convert it to a GDI COLORREF (0x00BBGGRR), falling back to the system
-// highlight colour if DWM is unavailable.
+// DwmGetColorizationColor (0xAARRGGBB) → GDI COLORREF (0x00BBGGRR).
+// Falls back to COLOR_HIGHLIGHT if DWM is unavailable.
 
 pub unsafe fn get_accent_color() -> COLORREF {
     let mut color: u32 = 0;
@@ -69,12 +67,9 @@ pub unsafe fn get_accent_color() -> COLORREF {
 }
 
 // ── Shared GDI+ helpers ───────────────────────────────────────────────────────
-//
-// Call gdip_init() once before any GDI+ draw call (cheap after first call).
-// These live here so every painter in this file can share them without
-// duplicating the startup boilerplate.
+// Call gdip_init() once before any GDI+ draw call; safe to call multiple times.
 
-/// Ensure GDI+ is started for this process.  Safe to call multiple times.
+/// Ensure GDI+ is started for this process.
 pub unsafe fn gdip_init() {
     static GDIP_TOKEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     GDIP_TOKEN.get_or_init(|| {
@@ -236,11 +231,8 @@ unsafe fn begin_mouse_track(hwnd: HWND, prop: PCWSTR) -> bool {
     true
 }
 
-// ── Custom slider WndProc ────────────────────────────────────────────────────
-//
-// We subclass each native trackbar and intercept WM_PAINT to draw our own
-// track+thumb. The native control still handles all input (drag, click, keys)
-// and fires WM_HSCROLL — we only replace the visual output.
+// ── Custom slider subclass ───────────────────────────────────────────────────
+// Intercepts WM_PAINT to draw a custom track+thumb; native control handles input.
 
 const SLIDER_ORIG_PROC_PROP:  PCWSTR = w!("BCT_SliderOrigProc");
 const SLIDER_HOVER_PROP:      PCWSTR = w!("BCT_SliderHover");
@@ -260,10 +252,7 @@ pub static SLIDER_ANIM_INTERVAL_MS: std::sync::atomic::AtomicU32 =
 // Thumb is a fixed size — only the inner fill dot animates on hover.
 const THUMB_D: i32 = 20;  // logical px, scaled by DPI
 
-// timeGetTime: high-resolution ms tick counter from winmm.lib.
-// GetTickCount has 10-15 ms granularity on some machines; timeGetTime is
-// guaranteed 1 ms resolution after timeBeginPeriod(1), and even without
-// that call it is typically ≤4 ms — far better than GetTickCount.
+// timeGetTime gives ~1ms resolution vs GetTickCount's 10-15ms.
 #[link(name = "winmm")]
 extern "system" {
     fn timeGetTime() -> u32;
@@ -312,8 +301,6 @@ pub unsafe extern "system" fn slider_subclass_proc(
 
             // Register WM_MOUSELEAVE once while cursor is anywhere inside the slider.
             begin_mouse_track(hwnd, w!("BCT_SliderTracking"));
-
-            // Track-level hover — set as soon as mouse is anywhere on the slider.
             begin_mouse_track(hwnd, SLIDER_TRACK_HOVER_PROP);
 
             // SLIDER_HOVER_PROP tracks thumb-specific hover — drives the animation.
@@ -324,8 +311,7 @@ pub unsafe extern "system" fn slider_subclass_proc(
                 } else {
                     RemovePropW(hwnd, SLIDER_HOVER_PROP);
                 }
-                // Snapshot the current fill value and wall-clock time so the
-                // delta-time interpolator has a well-defined start point.
+                // Snapshot current fill value and time for the delta-time interpolator.
                 let cur_fp = GetPropW(hwnd, SLIDER_FILL_PROP).0 as isize;
                 if cur_fp != 0 {
                     SetPropW(hwnd, SLIDER_ANIM_STARTVAL_PROP, HANDLE(cur_fp as *mut _));
@@ -337,11 +323,8 @@ pub unsafe extern "system" fn slider_subclass_proc(
                 InvalidateRect(hwnd, None, false);
             }
 
-            // Drag.
-            // slider_set_from_x sends WM_HSCROLL to the parent, which calls
-            // InvalidateRect on this control.  Don't call it again here —
-            // a second invalidate in the same message pump cycle causes a
-            // duplicate repaint on every mouse-move pixel during drag.
+            // On drag: slider_set_from_x sends WM_HSCROLL to parent which already
+            // calls InvalidateRect — don't call it again here to avoid duplicate repaints.
             if GetCapture() == hwnd {
                 slider_set_from_x(hwnd, mx);
             }
@@ -352,15 +335,14 @@ pub unsafe extern "system" fn slider_subclass_proc(
             RemovePropW(hwnd, SLIDER_HOVER_PROP);
             RemovePropW(hwnd, SLIDER_TRACK_HOVER_PROP);
             RemovePropW(hwnd, w!("BCT_SliderTracking"));
-            // Snapshot current fill and time so the shrink-back animation starts
-            // from wherever the dot currently is, not from a stale stored value.
+            // Snapshot current fill so shrink-back animation starts from the right value.
             let cur_fp = GetPropW(hwnd, SLIDER_FILL_PROP).0 as isize;
             if cur_fp != 0 {
                 SetPropW(hwnd, SLIDER_ANIM_STARTVAL_PROP, HANDLE(cur_fp as *mut _));
             }
             SetPropW(hwnd, SLIDER_ANIM_START_PROP,
                 HANDLE(timeGetTime() as usize as *mut _));
-            // Keep animation timer running so thumb shrinks back smoothly.
+            // Keep timer running so thumb shrinks back smoothly.
             let anim_ms = SLIDER_ANIM_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed);
             SetTimer(hwnd, SLIDER_ANIM_TIMER, anim_ms, None);
             InvalidateRect(hwnd, None, false);
@@ -398,7 +380,7 @@ pub unsafe extern "system" fn slider_subclass_proc(
             let is_hovering = !GetPropW(hwnd, SLIDER_HOVER_PROP).0.is_null();
             let is_dragging = !GetPropW(hwnd, SLIDER_DRAG_PROP).0.is_null();
 
-            // Thumb is always THUMB_D — compute the inner area available for the fill dot.
+            // Compute inner fill dot range (thumb is always THUMB_D).
             let border_w  = (2 * dpi / 96).max(1);
             let thumb_d   = (THUMB_D * dpi / 96).max(1);
             let inner_d   = (thumb_d - border_w * 2).max(2);
@@ -412,21 +394,18 @@ pub unsafe extern "system" fn slider_subclass_proc(
                 idle_dot * 16
             };
 
-            // Bootstrap: if SLIDER_FILL_PROP has never been set, start at idle.
+            // Bootstrap: start at idle if never set.
             let cur_fp_raw = GetPropW(hwnd, SLIDER_FILL_PROP).0 as isize;
             let cur_fp = if cur_fp_raw == 0 { idle_dot * 16 } else { cur_fp_raw as i32 };
 
-            // Delta-time eased interpolation.
-
+            // Delta-time ease-out cubic interpolation.
             let now_ms   = timeGetTime();
             let start_ms = GetPropW(hwnd, SLIDER_ANIM_START_PROP).0 as usize as u32;
             let elapsed  = now_ms.wrapping_sub(start_ms) as f32;
             let t        = (elapsed / ANIM_DURATION_MS).clamp(0.0, 1.0);
-            // Ease-out cubic: fast at start, decelerates to target.
             let eased    = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
 
-            // The start value for this transition is stored in SLIDER_ANIM_STARTVAL_PROP.
-            // Fall back to cur_fp if it was never set (e.g. first hover before any tick).
+            // Start value stored in SLIDER_ANIM_STARTVAL_PROP; fall back to cur_fp.
             let start_fp_raw = GetPropW(hwnd, SLIDER_ANIM_STARTVAL_PROP).0 as isize;
             let start_fp = if start_fp_raw == 0 { cur_fp } else { start_fp_raw as i32 };
 
@@ -476,7 +455,6 @@ pub unsafe fn slider_set_from_x(hwnd: HWND, mx: i32) {
     let dpi = GetDeviceCaps(hdc, LOGPIXELSX).max(96);
     ReleaseDC(hwnd, hdc);
 
-    // Use the thumb radius as the fixed margin.
     let thumb_r     = (THUMB_D * dpi / 96 / 2).max(1);
     let track_left  = thumb_r + (1 * dpi / 96).max(1);
     let track_right = w - thumb_r - (1 * dpi / 96).max(1);
@@ -537,8 +515,8 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
 
     // ── Geometry ─────────────────────────────────────────────────────────────
     let thumb_d  = slider_thumb_d(dpi);
-    // Split asymmetrically so left_half + right_half == thumb_d for any value,
-    // eliminating the 1-px gap that occurs when thumb_d is odd at non-100% DPI.
+    // Asymmetric halves so left+right == thumb_d for any value, eliminating
+    // the 1-px gap when thumb_d is odd at non-100% DPI.
     let thumb_hl = thumb_d / 2;
     let thumb_hr = thumb_d - thumb_hl;
     let track_h  = if is_track_hovering || is_dragging { s(6) } else { s(5) };
@@ -548,14 +526,14 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
     let track_r_x = w - thumb_hr - s(1);
     let track_span = (track_r_x - track_l).max(1);
 
-    // Round to nearest pixel so thumb never drifts ±1 px from its track position.
+    // Round to nearest pixel so thumb doesn't drift ±1px from track position.
     let thumb_cx = track_l + ((val - min) * track_span + range / 2) / range;
     let thumb_x  = thumb_cx - thumb_hl;
     let thumb_y  = track_cy - thumb_hl;
 
     let r = track_h / 2;
 
-    // Paint layers in Z-order to hide AA sub-pixel artifacts at track terminations.
+    // Paint layers in Z-order (hides AA artifacts at track terminations).
     gdip_init();
     let mut g: *mut GpGraphics = ptr::null_mut();
     GdipCreateFromHDC(mem_dc, &mut g);
@@ -584,7 +562,7 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
     let inner_y = thumb_y + pad;
 
     // ── Cached GDI+ brushes ───────────────────────────────────────────────────
-    // SAFETY: only ever accessed from the single UI thread.
+    // SAFETY: only accessed from the single UI thread.
     struct CachedBrush {
         argb:  u32,
         brush: *mut GpSolidFill,
@@ -635,9 +613,7 @@ pub unsafe fn paint_slider(hwnd: HWND, hdc: HDC) {
 }
 
 // ── Hold-to-compare button subclass ──────────────────────────────────────────
-//
-// Intercepts mouse down/up on the A/B button to implement hold-to-compare.
-// SetCapture ensures WM_LBUTTONUP is received even if the mouse leaves the button.
+// SetCapture ensures WM_LBUTTONUP is received even if mouse leaves the button.
 
 const BTN_ORIG_PROC_PROP: PCWSTR = w!("BCT_BtnOrigProc");
 
@@ -682,18 +658,12 @@ pub unsafe extern "system" fn compare_btn_subclass_proc(
 }
 
 // ── Action button hover subclass ─────────────────────────────────────────────
-//
-// Tracks mouse hover for regular push buttons (Minimize, Exit, Restore Defaults,
-// and the click-hold Compare button) so draw_dark_button_full can paint a
-// distinct hover background.  Uses the same begin_mouse_track / WM_MOUSELEAVE
-// pattern as the nav and slider subclasses.
+// Tracks mouse hover for push buttons so draw_dark_button_full can paint hover state.
 
 /// Window property set to non-null while the mouse is over the button.
 pub const ACTION_BTN_HOVER_PROP: PCWSTR = w!("BCT_ActionBtnHover");
 
 /// Attach the hover-tracking subclass to an action button.
-/// Call once after creating each push button (Minimize, Exit, Restore Defaults,
-/// Compare).
 pub unsafe fn install_action_btn_hover(hwnd: HWND) {
     SetWindowSubclass(hwnd, Some(action_btn_subclass_proc), 4, 0);
 }
@@ -715,7 +685,7 @@ pub unsafe extern "system" fn action_btn_subclass_proc(
             call_orig()
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP => {
-            // Repaint immediately on press/release so the pressed state is snappy.
+            // Repaint on press/release for snappy state change.
             InvalidateRect(hwnd, None, false);
             call_orig()
         }
@@ -729,11 +699,8 @@ pub unsafe extern "system" fn action_btn_subclass_proc(
 }
 
 // ── Navigation button subclass ───────────────────────────────────────────────
-//
-// Intercepts WM_SETFOCUS and WM_KILLFOCUS so the owner-draw path in
-// draw_nav_item can paint a keyboard-focus ring.  The focus state is stored as
-// a Win32 window property (BCT_NavFocused) so draw_nav_item can read it without
-// needing access to AppState.
+// Tracks focus and hover; stores state as window properties so draw_nav_item
+// can read them without needing AppState.
 
 const NAV_BTN_ORIG_PROC_PROP: PCWSTR = w!("BCT_NavBtnOrigProc");
 pub const NAV_BTN_FOCUSED_PROP: PCWSTR = w!("BCT_NavFocused");
@@ -759,7 +726,6 @@ pub unsafe extern "system" fn nav_btn_subclass_proc(
             call_orig()
         }
         WM_MOUSEMOVE => {
-            // Set hover flag and request WM_MOUSELEAVE tracking if not already doing so.
             begin_mouse_track(hwnd, NAV_BTN_HOVER_PROP);
             call_orig()
         }
@@ -780,25 +746,13 @@ pub unsafe extern "system" fn nav_btn_subclass_proc(
 }
 
 // ── Combobox subclass ─────────────────────────────────────────────────────────
-//
-// CBS_DROPDOWNLIST combobox — the selected-text area is drawn by the combobox
-// itself (no edit child).  The native painter calls RedrawWindow with
-// RDW_INVALIDATE | RDW_ERASE on selection changes, queuing WM_ERASEBKGND then
-// WM_PAINT as separate messages.  The window is visible between them, so even a
-// fast background fill in WM_ERASEBKGND produces a blank frame before the text
-// reappears — visible as flicker.
-//
-// Solution: suppress WM_ERASEBKGND completely (return 1, draw nothing) and do
-// all painting in WM_PAINT via a memory DC that is BitBlt'd in one atomic
-// operation.  No intermediate state ever reaches the screen.
-//
-// The listbox popup (COMBOLBOX) is a separate HWND — subclassed via
-// WM_CTLCOLORLISTBOX to suppress its white erase on fast mouse moves.
-// WM_CTLCOLORLISTBOX passes through so native item colours are untouched.
+// Suppresses WM_ERASEBKGND and paints via a back-buffered WM_PAINT blit to
+// eliminate flicker on selection changes. Listbox popup subclassed via
+// WM_CTLCOLORLISTBOX to suppress white erase on fast mouse moves.
 
 const COMBO_ORIG_PROC_PROP: PCWSTR = w!("BCT_ComboOrigProc");
 
-/// Paint the non-client border of a window in our dark style: 1px C_SEP rect.
+/// Paint the NC border: 1px C_SEP rect, brighter on hover.
 unsafe fn combo_paint_border(hwnd: HWND) {
     let hdc = GetWindowDC(hwnd);
     if hdc.0.is_null() { return; }
@@ -818,15 +772,13 @@ unsafe fn combo_paint_border(hwnd: HWND) {
     ReleaseDC(hwnd, hdc);
 }
 
-/// Render the combobox client area into `hdc` using a memory DC back-buffer
-/// so the blit is atomic — no intermediate blank frame reaches the screen.
+/// Render the combobox into `hdc` via a back-buffered blit — no intermediate blank frame.
 unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
     let mut rc = RECT::default();
     GetClientRect(hwnd, &mut rc);
     let w = rc.right;
     let h = rc.bottom;
 
-    // ── Back-buffer ───────────────────────────────────────────────────────────
     let mem_dc  = CreateCompatibleDC(hdc);
     let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
     let old_bmp = SelectObject(mem_dc, mem_bmp);
@@ -840,10 +792,7 @@ unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
     let txt_rc = RECT { left: 0, top: 0, right: w - btn_w, bottom: h };
     FillRect(mem_dc, &txt_rc, bg_br);
 
-    // Selected item text.
-    // The collapsed selected-item area: draw left-aligned matching list item style.
-    // When the list is open, WM_DRAWITEM paints each row (including the selected one)
-    // via draw_combo_item, so the split/right-align logic lives there.
+    // Draw selected item text left-aligned (list open: WM_DRAWITEM handles rows).
     let sel = SendMessageW(hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32;
     if sel >= 0 {
         let mut buf = [0u16; 128];
@@ -854,7 +803,7 @@ unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
             let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
             let old_font = SelectObject(mem_dc, HGDIOBJ(font.0 as *mut _));
 
-            // Find the " [" separator — Hz part left, suffix right in dimmer colour.
+            // Split on " [": Hz part left in C_FG, suffix right in C_LABEL.
             let split = buf[..len].windows(2).position(|w| w[0] == b' ' as u16 && w[1] == b'[' as u16);
             let mut label_rc = RECT {
                 left: txt_rc.left + 4, top: txt_rc.top,
@@ -904,7 +853,6 @@ unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
     GdipDeleteBrush(arrow_br as _);
     GdipDeleteGraphics(gp);
 
-    // ── Single atomic blit ────────────────────────────────────────────────────
     BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
 
     SelectObject(mem_dc, old_bmp);
@@ -913,22 +861,12 @@ unsafe fn combo_paint_buffered(hwnd: HWND, hdc: HDC) {
 }
 
 // ── Owner-draw combobox list item painter ─────────────────────────────────────
-//
-// Called from WM_DRAWITEM in app.rs for every item the combobox needs to paint,
-// including both the collapsed selected-item area (ODA_SELECT with itemID == -1
-// does not exist for CBS_OWNERDRAWFIXED — the collapsed face is a separate draw)
-// and each row in the open dropdown list.
-//
-// Layout: "144 Hz" drawn left-aligned in C_FG, "[7]" drawn right-aligned in
-// C_LABEL.  Items with no suffix draw the full text left-aligned in C_FG.
-// The selected/highlighted row gets a solid accent background.
+// Layout: label left-aligned in C_FG, "[suffix]" right-aligned in C_LABEL.
+// Selected row gets a solid accent background.
 
 pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
-    // ODA_DRAWENTIRE is 0x0001; ODA_SELECT is 0x0002; ODA_FOCUS is 0x0004.
-    // Skip focus-only redraws — we don't draw a focus rectangle.
-    if di.itemAction == ODA_FOCUS { return; }
-    // itemID == u32::MAX means "no item" (empty combo or collapsed-face sentinel).
-    if di.itemID == u32::MAX { return; }
+    if di.itemAction == ODA_FOCUS { return; } // skip focus-only redraws
+    if di.itemID == u32::MAX { return; }       // no item
 
     let hdc = di.hDC;
     let rc  = di.rcItem;
@@ -941,7 +879,6 @@ pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
     FillRect(hdc, &rc, bg_br);
     DeleteObject(bg_br);
 
-    // Fetch item text.
     let parent = GetParent(di.hwndItem).unwrap_or_default();
     let mut buf = [0u16; 128];
     let len = SendMessageW(di.hwndItem, CB_GETLBTEXT,
@@ -952,7 +889,6 @@ pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
     let font = SendMessageW(di.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0));
     let old_font = SelectObject(hdc, HGDIOBJ(font.0 as *mut _));
 
-    // Inset rect with 4px left pad, 2px right pad.
     let mut label_rc = RECT {
         left:   rc.left + 4,
         top:    rc.top,
@@ -960,7 +896,7 @@ pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
         bottom: rc.bottom,
     };
 
-    // Find " [" separator.
+    // Split on " [": label left, suffix right.
     let split = buf[..len].windows(2)
         .position(|w| w[0] == b' ' as u16 && w[1] == b'[' as u16);
 
@@ -971,7 +907,7 @@ pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
         SetTextColor(hdc, fg);
         DrawTextW(hdc, &mut buf[..sep], &mut label_rc,
             DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
-        let suffix_start = sep + 1; // skip the space before '['
+        let suffix_start = sep + 1;
         SetTextColor(hdc, label);
         DrawTextW(hdc, &mut buf[suffix_start..len], &mut label_rc,
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
@@ -985,9 +921,7 @@ pub unsafe fn draw_combo_item(di: &DRAWITEMSTRUCT) {
 }
 
 // ── Listbox popup subclass ─────────────────────────────────────────────────────
-//
-// Suppresses white erase on the COMBOLBOX popup on fast mouse moves.
-// All item-draw / scroll / mouse messages pass through unchanged.
+// Suppresses white erase on the COMBOLBOX on fast mouse moves; all other messages pass through.
 
 unsafe extern "system" fn combo_listbox_subclass_proc(
     hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
@@ -1024,17 +958,16 @@ pub unsafe extern "system" fn combo_subclass_proc(
     let call_orig = || -> LRESULT { DefSubclassProc(hwnd, msg, wp, lp) };
 
     match msg {
-        // Suppress erase entirely — WM_PAINT does a back-buffered atomic blit
-        // so no intermediate blank frame ever reaches the screen.
+        // Suppress erase — back-buffered WM_PAINT blit handles it atomically.
         WM_ERASEBKGND => LRESULT(1),
 
-        // Suppress the native themed border; stamp our own flat 1px one.
+        // Replace native themed border with our flat 1px one.
         WM_NCPAINT => {
             combo_paint_border(hwnd);
             LRESULT(0)
         }
 
-        // Re-stamp our border after any hover-driven NC repaint.
+        // Re-stamp our border after hover-driven NC repaint.
         WM_MOUSEMOVE => {
             begin_mouse_track(hwnd, w!("BCT_ComboHover"));
             let r = call_orig();
@@ -1048,7 +981,7 @@ pub unsafe extern "system" fn combo_subclass_proc(
             r
         }
 
-        // Own the full paint cycle. Back-buffered blit = no flicker.
+        // Full paint cycle via back-buffered blit.
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -1060,8 +993,7 @@ pub unsafe extern "system" fn combo_subclass_proc(
             LRESULT(0)
         }
 
-        // Install the listbox subclass before the popup erases itself.
-        // Pass through so native item colours are completely unaffected.
+        // Install listbox subclass before popup erases itself; pass through for native item colours.
         WM_CTLCOLORLISTBOX => {
             let h_listbox = HWND(lp.0 as *mut _);
             if !h_listbox.0.is_null() {
@@ -1086,12 +1018,8 @@ pub unsafe extern "system" fn combo_subclass_proc(
 }
 
 // ── Bitmap static label subclass ─────────────────────────────────────────────
-//
-// Paints an HBITMAP (pre-multiplied BGRA, same format as NavIcons) centred
-// inside a plain STATIC control using AlphaBlend.  The bitmap handle is stored
-// in the subclass ref-data parameter so no extra allocation is needed.
-//
-// Usage:
+// Paints an HBITMAP (pre-multiplied BGRA) centred inside a STATIC via AlphaBlend.
+// Bitmap handle stored in subclass ref-data — no extra allocation needed.
 //   install_bitmap_static(hwnd, hbmp);   // call once after control creation
 
 pub unsafe fn install_bitmap_static(hwnd: HWND, hbmp: Option<HBITMAP>) {
@@ -1117,7 +1045,7 @@ pub unsafe extern "system" fn bitmap_static_subclass_proc(
             let w = rc.right  - rc.left;
             let h = rc.bottom - rc.top;
 
-            // Fill background with the app background colour.
+            // Fill background.
             let bg_brush = CreateSolidBrush(crate::constants::C_BG);
             FillRect(hdc, &rc, bg_brush);
             DeleteObject(bg_brush);
@@ -1125,15 +1053,14 @@ pub unsafe extern "system" fn bitmap_static_subclass_proc(
             if ref_data != 0 && w > 0 && h > 0 {
                 let hbmp   = HBITMAP(ref_data as *mut _);
 
-                // Query actual bitmap dimensions — AlphaBlend requires the
-                // source rect to match the real bitmap size or it silently fails.
+                // Query actual bitmap dims — AlphaBlend fails silently if src rect doesn't match.
                 let mut bm = BITMAP::default();
                 GetObjectW(hbmp, std::mem::size_of::<BITMAP>() as i32,
                            Some(&mut bm as *mut _ as *mut _));
                 let bw = bm.bmWidth.max(1);
                 let bh = bm.bmHeight.abs().max(1);
 
-                let sz     = w.min(h);          // dest size: keep square, centred
+                let sz     = w.min(h); // square, centred
                 let bx     = rc.left + (w - sz) / 2;
                 let by_pos = rc.top  + (h - sz) / 2;
 
@@ -1170,27 +1097,26 @@ pub unsafe fn draw_dark_tab(di: &DRAWITEMSTRUCT, accent: COLORREF,
     let rc  = di.rcItem;
     let is_sel = di.itemState.0 & ODS_SELECTED.0 != 0;
 
-    // Selected: same bg as the main panel so the tab "opens into" it.
-    // Unselected: slightly darker so they recede visually without disappearing.
+    // Selected: bg matches panel so tab "opens into" it; unselected: slightly darker.
     let bg_color = if is_sel { C_BG } else { COLORREF(0x00202020) };
     let br = CreateSolidBrush(bg_color);
     FillRect(hdc, &rc, br);
     DeleteObject(br);
 
     if is_sel {
-        // Bold accent bar across the top edge of the selected tab.
+        // Accent bar on top edge.
         let bar_h = 2i32;
         let bar = RECT { left: rc.left + 1, top: rc.top, right: rc.right - 1, bottom: rc.top + bar_h };
         let bar_br = CreateSolidBrush(accent);
         FillRect(hdc, &bar, bar_br);
         DeleteObject(bar_br);
-        // Bottom separator: erase the tab control's bottom border so it blends into the panel.
+        // Erase bottom border so tab blends into the panel.
         let bot = RECT { left: rc.left, top: rc.bottom - 1, right: rc.right, bottom: rc.bottom };
         let bg_br = CreateSolidBrush(C_BG);
         FillRect(hdc, &bot, bg_br);
         DeleteObject(bg_br);
     } else {
-        // Subtle bottom border line on unselected tabs to ground them.
+        // Subtle bottom line on unselected tabs.
         let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00383838));
         let old = SelectObject(hdc, pen);
         MoveToEx(hdc, rc.left,      rc.bottom - 1, None);
@@ -1222,11 +1148,8 @@ pub unsafe fn draw_dark_tab(di: &DRAWITEMSTRUCT, accent: COLORREF,
     DrawTextW(hdc, &mut buf[..len], &mut rc_text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
-// ── Left-panel vertical navigation item painter ───────────────────────────────
-//
-// `icon_hicon`  — if non-null, the app HICON is drawn scaled to 16×16 left of the label.
-// `icon_glyph`  — if non-empty, a Unicode glyph string drawn left of the label instead.
-// Only one of the two should be supplied; icon_hicon takes priority.
+// ── Left-panel navigation item painter ───────────────────────────────────────
+// icon_hicon takes priority over icon_glyph; supply only one.
 
 pub unsafe fn draw_nav_item(
     di: &DRAWITEMSTRUCT,
@@ -1243,10 +1166,7 @@ pub unsafe fn draw_nav_item(
     let is_pressed = di.itemState.0 & ODS_SELECTED.0 != 0;
 
     let row_h = rc.bottom - rc.top;
-    // Use GetDpiForWindow rather than GetDeviceCaps(hdc, LOGPIXELSX): the HDC
-    // passed to WM_DRAWITEM can still report the old DPI for a brief window
-    // after WM_DPICHANGED, which would cause the icon to be drawn at the wrong
-    // size and force AlphaBlend to stretch/shrink the already-correct bitmap.
+    // Use GetDpiForWindow: HDC from WM_DRAWITEM can report old DPI briefly after WM_DPICHANGED.
     let dpi   = GetDpiForWindow(di.hwndItem) as i32;
     let dpi   = if dpi < 96 { 96 } else { dpi };
     let s     = |px: i32| (px * dpi / 96).max(1);
@@ -1292,9 +1212,7 @@ pub unsafe fn draw_nav_item(
     let icon_cy    = rc.top + (row_h - icon_size) / 2;
 
     if let Some(hbmp) = icon_bitmap {
-        // Draw the PNG bitmap with per-pixel alpha via AlphaBlend.
-        // Query actual bitmap dimensions — source rect must match the real
-        // bitmap size or AlphaBlend clips/stretches incorrectly.
+        // Query actual bitmap dims — source rect must match or AlphaBlend clips/stretches.
         let mut bm = BITMAP::default();
         GetObjectW(hbmp, std::mem::size_of::<BITMAP>() as i32,
                    Some(&mut bm as *mut _ as *mut _));
@@ -1327,19 +1245,12 @@ pub unsafe fn draw_nav_item(
             DI_NORMAL,
         );
     } else if !icon_glyph.is_empty() {
-        // ── Option C: taskbar bar with 3 icon squares + dim overlay ──────────
-        // Pure GDI — no font required, sharp at any DPI.
-        //
-        // Layout within icon_size × icon_size:
-        //   bar sits at ~40% down, height ~40% of icon_size.
-        //   3 small squares inside the bar.
-        //   Dim overlay covers the bar interior at reduced opacity.
-
+        // Taskbar icon: bar with 3 squares + dim overlay, pure GDI.
         let r = (text_color.0       & 0xFF) as u8;
         let g = ((text_color.0 >> 8)  & 0xFF) as u8;
         let b = ((text_color.0 >> 16) & 0xFF) as u8;
 
-        // Blend colour toward C_BG (0x1A,0x1A,0x1A) at given alpha 0-255.
+        // Blend colour toward C_BG at given alpha 0-255.
         let blend = |fr: u8, fg_: u8, fb: u8, alpha: u8| -> COLORREF {
             let a  = alpha as u32;
             let na = 255 - a;
@@ -1353,7 +1264,7 @@ pub unsafe fn draw_nav_item(
         let sz  = icon_size;
         let bx  = icon_x;
         let bh  = (sz * 2 / 5).max(4);
-        let by  = icon_cy + (sz - bh) / 2;  // center bar vertically in icon cell
+        let by  = icon_cy + (sz - bh) / 2;
 
         // Bar outline.
         let border_pen = CreatePen(PS_SOLID, 1, blend(r, g, b, 160));
@@ -1370,9 +1281,7 @@ pub unsafe fn draw_nav_item(
         FillRect(hdc, &inner, fill_br);
         DeleteObject(fill_br);
 
-        // 3 small icon squares evenly spaced inside the bar.
-        // sq is sized relative to bh so they fit comfortably; gap is computed
-        // against the bar interior width (sz - 2) to prevent left-edge clipping.
+        // 3 small squares evenly spaced inside the bar.
         let sq   = ((bh - 4) * 2 / 3).max(2);
         let interior_w = sz - 2;
         let gap  = ((interior_w - 3 * sq) / 4).max(1);
@@ -1385,7 +1294,7 @@ pub unsafe fn draw_nav_item(
         }
         DeleteObject(icon_br);
 
-        // Bright top-edge accent line (the "dim glow").
+        // Top-edge accent line.
         let accent_pen = CreatePen(PS_SOLID, 1, blend(r, g, b, 220));
         let old_pen2   = SelectObject(hdc, accent_pen);
         MoveToEx(hdc, bx + 1,     by, None);
@@ -1400,8 +1309,7 @@ pub unsafe fn draw_nav_item(
     let mut buf = [0u16; 128];
     let len = GetWindowTextW(di.hwndItem, &mut buf) as usize;
 
-    // When a badge is shown, pre-measure its width and shrink the label rect
-    // so the label never overlaps the badge.
+    // Pre-measure badge width so label never overlaps it.
     let badge_text: Vec<u16> = "Update".encode_utf16().collect();
     let badge_reserve = if badge {
         let mut rc_b = RECT { left: 0, top: 0, right: 500, bottom: 40 };
@@ -1434,9 +1342,8 @@ pub unsafe fn draw_nav_item(
     }
 }
 
-/// Full dark-button / checkbox painter used by the main window's WM_DRAWITEM.
-/// `AppState`-specific state (which handle is which, checkbox flags, toggle-active)
-/// is passed as individual arguments so this module stays independent of app.rs.
+/// Full dark-button / checkbox painter for the main window's WM_DRAWITEM.
+/// AppState-specific flags passed as arguments to keep this module independent of app.rs.
 pub unsafe fn draw_dark_button_full(
     di: &DRAWITEMSTRUCT,
     h_chk_auto_hz: HWND, h_chk_startup: HWND, h_chk_taskbar_dim: HWND,
@@ -1489,8 +1396,7 @@ pub unsafe fn draw_dark_button_full(
 
         let accent = get_accent_color();
 
-        // ── Shared pill helper (closure-like macro pattern) ───────────────────
-        // Draws track + thumb at the given position using GDI+ for smooth edges.
+        // Pill helper: draws track + thumb with GDI+ smooth edges.
         let is_hovered = !GetPropW(di.hwndItem, TOGGLE_HOVER_PROP).0.is_null();
         let draw_pill = |tr_x: i32, tr_y: i32, tr_h: i32, tr_w: i32| {
             let th_pad = (2 * dpi / 96).max(1);
@@ -1525,7 +1431,7 @@ pub unsafe fn draw_dark_button_full(
             GdipDeleteGraphics(gp);
         };
 
-        // ── h_chk_startup (sidebar): pill RIGHT-aligned, label to its left ───
+        // h_chk_startup: pill RIGHT-aligned, label to its left.
         if di.hwndItem == h_chk_startup {
             let pad    = (2 * dpi / 96).max(2);
             let tr_h   = box_sz;
@@ -1544,7 +1450,7 @@ pub unsafe fn draw_dark_button_full(
             return;
         }
 
-        // ── h_chk_taskbar_dim (content): pill LEFT-aligned, label to its right
+        // h_chk_taskbar_dim: pill LEFT-aligned, label to its right.
         if di.hwndItem == h_chk_taskbar_dim {
             let tr_h   = box_sz;
             let tr_w   = (box_sz * 2).max(22);
@@ -1563,7 +1469,7 @@ pub unsafe fn draw_dark_button_full(
             return;
         }
 
-        // ── Standard checkbox (auto-Hz, startup) ─────────────────────────────
+        // Standard checkbox (auto-Hz, startup).
         if checked {
             gdip_init();
             let mut gp: *mut GpGraphics = ptr::null_mut();
@@ -1573,7 +1479,7 @@ pub unsafe fn draw_dark_button_full(
             fill_round_rect(gp, fill_col, 0xFF, box_x, box_y, box_sz, box_sz, radius);
             GdipDeleteGraphics(gp);
 
-            // Checkmark tick — GDI+ for antialiased stroke.
+            // Checkmark tick via GDI+ antialiased stroke.
             let pen_w_f = (2 * dpi / 96).max(2) as f32;
             let mut ck_pen: *mut GpPen = ptr::null_mut();
             GdipCreatePen1(0xFFFFFFFF_u32, pen_w_f, UnitPixel, &mut ck_pen);
@@ -1614,9 +1520,7 @@ pub unsafe fn draw_dark_button_full(
     // ── Regular push buttons ─────────────────────────────────────────────────
     let is_active = di.hwndItem == h_btn_toggle && btn_toggle_active;
 
-    // Read hover state from the window property set by action_btn_subclass_proc.
-    // The caller may also pass `is_hovered` directly (e.g. when it already has
-    // the flag from AppState), so OR both sources together.
+    // Combine hover from window property and caller-supplied flag.
     let btn_hovered = is_hovered
         || !GetPropW(di.hwndItem, ACTION_BTN_HOVER_PROP).0.is_null();
 
@@ -1634,7 +1538,6 @@ pub unsafe fn draw_dark_button_full(
     } else if is_sel {
         (C_BTN_PRESS, C_BTN_BORDER, C_BTN_TEXT)
     } else if btn_hovered {
-        // Subtle hover: slightly lighter background and brighter border.
         (lighten_colorref(C_BTN_NORMAL, 18), lighten_colorref(C_BTN_BORDER, 40), C_BTN_TEXT)
     } else {
         (C_BTN_NORMAL, C_BTN_BORDER, C_BTN_TEXT)
@@ -1662,11 +1565,7 @@ pub unsafe fn draw_dark_button_full(
 }
 
 // ── HDR toggle switch painter ─────────────────────────────────────────────────
-//
-// Draws the "Enable HDR" row: label on the left, pill toggle on the right.
-// Identical geometry to the "Launch with Windows" pill so both rows match.
-// Moved here from app.rs so all toggle painting lives in one place and shares
-// the GDI+ helpers for antialiased edges.
+// Draws a label-left, pill-right row. Geometry matches the startup pill.
 
 pub unsafe fn draw_hdr_toggle_switch(
     di:      &DRAWITEMSTRUCT,
@@ -1691,8 +1590,7 @@ pub unsafe fn draw_hdr_toggle_switch(
     let tr_x   = rc.right - tr_w - pad * 2;
     let tr_y   = rc.top + (h - tr_h) / 2;
 
-    // Label — read from the window text so any button using this painter
-    // shows its own label rather than a hardcoded string.
+    // Read label from window text so any button using this painter shows its own label.
     SetTextColor(hdc, C_FG);
     let mut lbl_buf = [0u16; 128];
     let lbl_len = GetWindowTextW(di.hwndItem, &mut lbl_buf) as usize;
@@ -1735,16 +1633,13 @@ pub unsafe fn draw_hdr_toggle_switch(
 }
 
 // ── Tab header painter (icon + title text) ────────────────────────────────────
-//
-// Call `subclass_tab_header(hwnd, hbitmap)` once after creating a title label.
-// The subclass proc intercepts WM_PAINT and draws the PNG icon to the left of
-// the title text, scaled to ~32 logical px (2× the nav icon size).
+// Call subclass_tab_header(hwnd, hbitmap) once after creating a title label.
 
 const TAB_HDR_ORIG_PROC:    PCWSTR = w!("BCT_TabHdrOrigProc");
 pub const TAB_HDR_BITMAP:   PCWSTR = w!("BCT_TabHdrBitmap");
 
 /// Attach the tab-header painter to a static title label.
-/// `hbitmap` may be null — in that case only the text is drawn (same as before).
+/// `hbitmap` may be null — text only in that case.
 pub unsafe fn subclass_tab_header(hwnd: HWND, hbitmap: Option<HBITMAP>) {
     let bmp_raw = hbitmap.map(|b| b.0 as isize).unwrap_or(0);
     SetPropW(hwnd, TAB_HDR_BITMAP, HANDLE(bmp_raw as *mut _));
@@ -1793,7 +1688,7 @@ unsafe fn paint_tab_header(hwnd: HWND, hdc: HDC) {
     let dpi    = GetDpiForWindow(hwnd) as i32;
     let dpi    = if dpi < 96 { 96 } else { dpi };
     let s      = |px: i32| (px * dpi / 96).max(1);
-    // Icon drawn at 20 logical px — matches the baked TabHeaderIcons bitmap size.
+    // Icon at 20 logical px — matches baked TabHeaderIcons bitmap size.
     let icon_sz = s(20);
     let gap     = s(10);
 
@@ -1803,7 +1698,7 @@ unsafe fn paint_tab_header(hwnd: HWND, hdc: HDC) {
         let hdc_mem = CreateCompatibleDC(hdc);
         let old     = SelectObject(hdc_mem, hbmp);
 
-        // Vertically centre the icon within the control height.
+        // Vertically centre icon.
         let ctrl_h = rc.bottom - rc.top;
         let icon_y = rc.top + (ctrl_h - icon_sz) / 2;
 
