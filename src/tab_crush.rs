@@ -103,7 +103,7 @@ impl CrushTab {
         let h_lbl_sl_hint    = cb.static_text(w!(""), 0);
         let h_lbl_gamma_warn = cb.static_text(w!(""), 0);
         let h_lbl_hdr_sect   = cb.static_text(w!("HDR-Black Calibration"), SS_NOPREFIX);
-        let h_sld_squares    = cb.slider(IDC_SLD_SQUARES, 9, 24, 9);
+        let h_sld_squares    = cb.slider(IDC_SLD_SQUARES, 9, 24, 16);
         let h_lbl_range_val  = cb.static_text(w!(""), SS_CENTERIMAGE);
         let h_lbl_hdr_note   = cb.static_text(
             w!("⚠  HDR colour space not detected — enable Windows HDR for accurate results"),
@@ -157,7 +157,7 @@ impl CrushTab {
         group_handles.extend_from_slice(&h_sep_h[0..4]);
         let group = ControlGroup::new(group_handles);
 
-        let s = Self {
+        let mut s = Self {
             h_lbl_title, h_lbl_sub1, h_lbl_sub2,
             h_lbl_bl_sect, h_sld_black, h_lbl_black_val,
             h_lbl_sl_hint, h_lbl_gamma_warn,
@@ -173,6 +173,7 @@ impl CrushTab {
             hdr_note_color: COLORREF(0x00888888),
         };
         s.update_sl_hint();
+        s.on_squares_changed(); // sync render to default slider position
         s
     }
 
