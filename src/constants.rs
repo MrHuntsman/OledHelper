@@ -64,8 +64,8 @@ pub const TIMER_OVERLAY_FADE:         usize = 5;  // ~16 ms tick for overlay hov
 pub const TIMER_CRUSH_REPEAT:         usize = 11; // repeating tick while increase/decrease key is held
 
 // ── Business logic limits ─────────────────────────────────────────────────────
-pub const MIN_BLACK:     i32 = -15;
-pub const MAX_BLACK:     i32 = 15;
+pub const MIN_BLACK:     i32 = -150;
+pub const MAX_BLACK:     i32 = 150;
 pub const DEFAULT_BLACK: i32 = 0;
 
 pub const MIN_WIN_W: i32 = 720; // logical px at 96 DPI

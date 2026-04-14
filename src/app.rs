@@ -45,7 +45,7 @@ use crate::{
     controls::ControlBuilder,
     gamma_ramp,
     profile_manager::ProfileManager,
-    tab_crush::{CrushTab, get_current_hz, hz_section, render_interval_ms},
+    tab_crush::{CrushTab, black_val_label, get_current_hz, hz_section, render_interval_ms},
     tab_debug::DebugTab,
     tab_about::AboutTab,
     tab_hotkeys::{HotkeysTab, draw_hotkey_pill},
@@ -1534,7 +1534,7 @@ unsafe fn create_state(hwnd: HWND, ini_path: PathBuf) -> AppState {
     let sec = hz_section(hz);
     if state.ini.read(&sec, "Black", "__x__") == "__x__" {
         let fallback = state.ini.read_int("_state", "Black", DEFAULT_BLACK)
-            .clamp(0, MAX_BLACK);
+            .clamp(MIN_BLACK, MAX_BLACK);
         state.ini.write_int(&sec, "Black", fallback);
     }
     if let Some((v, _status)) =
@@ -1543,11 +1543,11 @@ unsafe fn create_state(hwnd: HWND, ini_path: PathBuf) -> AppState {
         // Profile silently applied — no status message on startup.
     } else {
         let saved_v = state.ini.read_int(&sec, "Black", DEFAULT_BLACK)
-            .clamp(0, MAX_BLACK);
+            .clamp(MIN_BLACK, MAX_BLACK);
         SendMessageW(state.crush.h_sld_black, TBM_SETPOS,
             WPARAM(1), LPARAM(saved_v as isize));
         InvalidateRect(state.crush.h_sld_black, None, true);
-        let v_text = if saved_v == 0 { "OFF".to_string() } else { format!("{saved_v}") };
+        let v_text = black_val_label(saved_v);
         set_text(state.crush.h_lbl_black_val, &v_text);
         // apply_ramp is called unconditionally below — no need to call it here too.
         state.crush.hdr_panel.update(saved_v);

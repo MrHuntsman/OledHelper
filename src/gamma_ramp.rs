@@ -46,7 +46,7 @@ pub fn build_ramp(black_lift: i32) -> GammaRamp {
             let t      = i as f64 / 255.0;
             let abs_bl = black_lift.unsigned_abs() as i32;
             let blend  = (1.0 - t) / (1.0 + t * 2.0);
-            let floor  = (abs_bl as f64 / 255.0) * blend;
+            let floor  = (abs_bl as f64 / 2550.0) * blend;
             let lifted = floor + t * (1.0 - floor);
             if black_lift >= 0 {
                 lifted.clamp(0.0, 1.0)

@@ -457,9 +457,15 @@ impl CrushTab {
 /// INI section key for a given refresh rate.
 pub fn hz_section(hz: i32) -> String { format!("hz_{hz}") }
 
-/// Display label for a black-level value: "OFF" at 0, signed integer otherwise.
+/// Display label for a black-level value: "OFF" at 0, one decimal place otherwise.
 pub fn black_val_label(v: i32) -> String {
-    if v == 0 { "OFF".to_string() } else { format!("{v:+}") }
+    if v == 0 {
+        "OFF".to_string()
+    } else {
+        let sign = if v > 0 { "+" } else { "-" };
+        let abs  = v.unsigned_abs();
+        format!("{}{}.{}", sign, abs / 10, abs % 10)
+    }
 }
 
 /// Current display refresh rate in Hz.
