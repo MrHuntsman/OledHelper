@@ -348,6 +348,13 @@ pub struct DimmerTab {
     pub fullscreen_active: bool,
     /// Updated each fade tick via SHAppBarMessage.
     pub taskbar_autohide: bool,
+    /// Counts how many deferred rechecks have fired since the last foreground event.
+    /// Drives the multi-shot recheck schedule: t+200 ms → t+500 ms → t+1000 ms → t+3000 ms.
+    pub recheck_count: u8,
+    /// HWND captured by the WinEvent hook at foreground-change time.
+    /// Rechecks test both this and GetForegroundWindow() -- a taskbar click can
+    /// cause GetForegroundWindow() to lag behind the hook HWND briefly.
+    last_foreground_hwnd: HWND,
 
     // ── Heavy-poll throttling ─────────────────────────────────────────────────
     /// Wrapping counter; expensive Win32 calls only fire every N ticks (~500 ms idle).
@@ -716,6 +723,8 @@ impl DimmerTab {
             last_applied_alpha: 0,
             fullscreen_active,
             taskbar_autohide: false,
+            recheck_count: 0,
+            last_foreground_hwnd: HWND(std::ptr::null_mut()),
             idle_heavy_tick: 0,
             last_zorder_enforce_tick: 0,
             last_logged_zpos: Vec::new(),
@@ -1018,7 +1027,16 @@ impl DimmerTab {
     /// Runs an immediate fullscreen check and re-asserts overlay Z-order.
     /// Caller (app.rs) should also arm TIMER_FULLSCREEN_RECHECK for late-sizing games.
     pub unsafe fn on_fullscreen_check(&mut self, fg_hwnd: HWND) {
-        self.fullscreen_active = is_fullscreen_on_monitor(fg_hwnd);
+        // Store the hook HWND so rechecks can test it alongside GetForegroundWindow().
+        // A taskbar click on a background game can cause GetForegroundWindow() to lag
+        // behind the hook HWND briefly; testing both ensures neither path is missed.
+        self.last_foreground_hwnd = fg_hwnd;
+
+        if self.suppress_fs_enabled {
+            self.fullscreen_active =
+                is_fullscreen_on_monitor(fg_hwnd) ||
+                is_fullscreen_on_monitor(GetForegroundWindow());
+        }
 
         if !self.fullscreen_active {
             raise_and_log_overlay_zpos(&self.taskbar_overlays, &mut self.last_logged_zpos);
@@ -1029,7 +1047,12 @@ impl DimmerTab {
     /// Catch games that resize late after becoming foreground.
     pub unsafe fn on_fullscreen_recheck(&mut self) {
         if self.suppress_fs_enabled {
-            self.fullscreen_active = is_fullscreen_on_monitor(GetForegroundWindow());
+            // Test both the hook HWND from the original foreground event and the
+            // current foreground window -- covers both late-sizing games and the
+            // taskbar-click race where GetForegroundWindow() lags the hook HWND.
+            self.fullscreen_active =
+                is_fullscreen_on_monitor(self.last_foreground_hwnd) ||
+                is_fullscreen_on_monitor(GetForegroundWindow());
         }
     }
 
@@ -1389,13 +1412,35 @@ unsafe fn is_fullscreen_on_monitor(fg: HWND) -> bool {
     GetWindowRect(fg, &mut wr);
 
     let mr = mi.rcMonitor;
-    let covers_monitor =
-        (wr.left   - mr.left).abs()   <= 1 &&
-        (wr.top    - mr.top).abs()    <= 1 &&
-        (wr.right  - mr.right).abs()  <= 1 &&
-        (wr.bottom - mr.bottom).abs() <= 1;
 
-    if !covers_monitor { return false; }
+    // Primary check: GetWindowRect vs monitor rect.
+    // Tolerance of 8 px each side accommodates DWM's invisible resize border
+    // (WS_THICKFRAME adds ~8 px of off-screen frame on Win10/11) and games
+    // that size to the work area before the final fullscreen SetWindowPos.
+    let covers_monitor =
+        wr.left   <= mr.left   + 8 &&
+        wr.top    <= mr.top    + 8 &&
+        wr.right  >= mr.right  - 8 &&
+        wr.bottom >= mr.bottom - 8;
+
+    // Secondary check: if GetWindowRect doesn't cover (e.g. game reports a
+    // slightly-off outer rect during the resize), compare the client rect
+    // mapped to screen coordinates instead — that always matches the visible area.
+    let covers = if covers_monitor {
+        true
+    } else {
+        let mut cr = RECT::default();
+        GetClientRect(fg, &mut cr);
+        let mut pt = POINT { x: 0, y: 0 };
+        ClientToScreen(fg, &mut pt);
+        let cw = cr.right  - cr.left;
+        let ch = cr.bottom - cr.top;
+        let mw = mr.right  - mr.left;
+        let mh = mr.bottom - mr.top;
+        cw >= mw - 2 && ch >= mh - 2
+    };
+
+    if !covers { return false; }
 
     // Class-name check — filters shell/desktop windows that happen to be full-monitor-sized.
     let mut cls_buf = [0u16; 64];

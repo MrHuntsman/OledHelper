@@ -706,9 +706,19 @@ unsafe extern "system" fn wnd_proc(
                         set_status(st, "", C_ACCENT);
                     }
                     TIMER_FULLSCREEN_RECHECK => {
-                        // One-shot: catches late-sizing games ~1 s after a foreground event.
                         KillTimer(hwnd, TIMER_FULLSCREEN_RECHECK);
                         st.dimmer.on_fullscreen_recheck();
+                        st.dimmer.recheck_count += 1;
+                        // Multi-shot schedule: cumulative t+200, t+500, t+1000, t+3000 ms.
+                        let next_ms: Option<u32> = match st.dimmer.recheck_count {
+                            1 => Some(300),
+                            2 => Some(500),
+                            3 => Some(2000),
+                            _ => None,
+                        };
+                        if let Some(ms) = next_ms {
+                            SetTimer(hwnd, TIMER_FULLSCREEN_RECHECK, ms, None);
+                        }
                     }
                     TIMER_OVERLAY_REPOSITION => {
                         st.dimmer.tick_reposition();
@@ -1295,8 +1305,10 @@ unsafe extern "system" fn wnd_proc(
             if let Some(st) = borrow_state::<AppState>(hwnd) {
                 let fg_hwnd = HWND(wparam.0 as *mut _);
                 st.dimmer.on_fullscreen_check(fg_hwnd);
-                // One-shot recheck ~1 s later to catch late-sizing games.
-                SetTimer(hwnd, TIMER_FULLSCREEN_RECHECK, 1000, None);
+                // Multi-shot recheck for late-sizing games (borderless fullscreen).
+                // Schedule: t+200 ms, t+500 ms, t+1000 ms, t+3000 ms.
+                st.dimmer.recheck_count = 0;
+                SetTimer(hwnd, TIMER_FULLSCREEN_RECHECK, 200, None);
             }
             LRESULT(0)
         }

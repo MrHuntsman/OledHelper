@@ -1,6 +1,6 @@
 [package]
 name  = "oled-helper"
-version = "1.0.0-Beta"
+version = "1.0.1-Beta"
 edition = "2021"
 description = "Helper tools for OLED tv/monitors"
 
